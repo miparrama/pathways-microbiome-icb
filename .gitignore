@@ -1,0 +1,16 @@
+
+microbeICB/integration/Harmonize_files/
+microbeICB/integration/MMUPHin_lm_meta/
+microbeICB/integration/output/data/*
+microbeICB/integration/.Rhistory
+microbeICB/integration/.Rproj.user/
+microbeICB/studies_old
+microbeICB/integration/resources/mpa_vOct22_CHOCOPhlAnSGB_202212.nwk
+
+drup_gut/preprocessing/
+drup_gut/workflows/
+drup_gut/resources/*
+drup_gut/analysis/output/data/*
+drup_gut/analysis/new_data/
+drup_gut/analysis/.Rhistory
+drup_gut/analysis/.Rproj.user/

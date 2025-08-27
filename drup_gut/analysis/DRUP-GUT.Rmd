@@ -1,0 +1,1147 @@
+---
+title: "DRUP-GUT"
+author: "Thomas W. Battaglia & Miguel Parra-Martinez"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source('scripts/helpers.R')
+
+module_names = read_csv("../../resources/module_names.csv") %>% 
+  mutate(short_name = str_remove(Name, " =>.*$"))
+
+# Annotations for metacyc pathway
+metacyc.names = data.table::fread("../../resources/map_metacyc-pwy_name.txt.gz", header = F) %>% 
+  rename(ID = V1, name = V2)
+```
+
+# Import tumor features
+```{r}
+# # Import all MSI-samples (n=107)
+complete.msicohort = read_csv("/DATA/share/Voesties/data/resources/msi_cohort/biomarkers/data/dMMR-MSIH-ICB-all.csv") %>%
+  filter(msStatus == "MSI")
+```
+
+
+# Quality analysis
+
+## Humann3
+Figure S3A and S3B
+```{r}
+# Import humann reports
+humann.report = list.files("../workflows/biobakery/results/humann/", pattern = "*-report.txt", recursive = T, full.names = T) %>% 
+  map_dfr(data.table::fread) %>% 
+  na.omit() %>% 
+  janitor::clean_names() %>% 
+  rename(Sample = number_samples) %>% 
+  mutate(nucleotide_percent = total_nucleotide_aligned / total_reads) %>% 
+  mutate(translated = total_translated_aligned / total_reads) %>% 
+  mutate(unassigned_percent =  1 - translated) %>% 
+  mutate(translated_percent = 1 - (unassigned_percent + nucleotide_percent))
+
+# Plot number of readss
+p1 = humann.report %>% 
+  gather(Metric, percent, -Sample) %>% 
+  filter(Metric %in% c("nucleotide_percent", "unassigned_percent", "translated_percent")) %>% 
+  mutate(Metric = fct_recode(Metric, Nucleotide = "nucleotide_percent", Translated = "translated_percent", `Unassigned reads` = "unassigned_percent")) %>% 
+  ggplot(aes(x = Sample, y = percent, fill = Metric)) +
+  geom_col() +
+  theme_classic2() +
+  theme(axis.text.x = element_blank(), legend.position = "bottom") +
+  # jcolors::scale_fill_jcolors(palette = "default") +
+  scale_fill_brewer(palette = "Paired") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  xlab("Sample") +
+  ylab("Percent of sequenced reads") 
+
+# Plot boxplot side-by-side
+p2 = humann.report %>% 
+  gather(Metric, percent, -Sample) %>% 
+  filter(Metric %in% c("nucleotide_percent", "unassigned_percent", "translated_percent")) %>% 
+  mutate(Metric = fct_recode(Metric, Nucleotide = "nucleotide_percent", Translated = "translated_percent", `Unassigned \n reads` = "unassigned_percent")) %>% 
+  mutate(percent = as.numeric(percent)) %>% 
+  ggplot(aes(x = Metric, y = percent, fill = Metric)) +
+  stat_boxplot(geom='errorbar', linetype=1, width=0.15) +
+  geom_boxplot(width = 0.5) +
+  guides(fill="none") +
+  theme_few() +
+  scale_fill_brewer(palette = "Paired") +
+  #jcolors::scale_fill_jcolors(palette = "default") +
+  scale_y_continuous(labels = scales::percent, limits = c(0,1.05)) +
+  xlab("") +
+  ylab("")
+
+# Plot together
+p = (p1 + p2) + plot_layout(widths = c(3, 1), guides = "collect") & theme(legend.position = 'bottom')
+p 
+ggsave(filename = "output/figures/humann-summary-drup.pdf", p, width = 11, height = 6)
+
+```
+
+
+
+
+-----
+
+# Metaphlan4
+
+```{r}
+# Import metaphlan4 tables
+metaphlan.files = list.files("../workflows/biobakery/results/metaphlan/read_stats/", full.names = T)
+names(metaphlan.files) =  list.files("../workflows/biobakery/results/metaphlan/read_stats/") %>%
+  basename() %>%
+  str_remove("-reads.txt")
+
+# Remove negative control
+metaphlan.files = metaphlan.files[names(metaphlan.files) != "NA"]
+
+# Statistics of the cohort
+clinical.data = readxl::read_excel("/DATA/share/Voesties/data/resources/msi_cohort/data/Nivolumab1st2ndand3trdstage_forTomandJoris.xlsx") %>%
+  dplyr::select(subjectkey, birth.year ) %>%
+  mutate(subjectkey = str_remove_all(subjectkey, "-")) %>%
+  mutate(age = 2020 - birth.year) %>%
+  rename(patientId = subjectkey) %>%
+  dplyr::select(patientId, age)
+
+# Create metadata table
+drup.metadata = read_csv("../preprocessing/drup-gut-metadata.csv") %>%
+  filter(Sample %in% names(metaphlan.files)) %>%
+  add_count(patientId, name = "num_samples") %>%
+  mutate(lineage = if_else(tumor_type %in% c("Endometrial cancer", "CRC", "Stomach cancer", "Small intestine cancer"), "lineage", "nonlineage")) %>%
+  mutate(hospitalId = substr(patientId, 7, 8),
+         hospitalId = paste0("hospital", hospitalId)) %>%
+  mutate(time = if_else(timepoint == "T1", 0, if_else(timepoint == "T3", 2, 1))) %>%
+  mutate(ATB_use = if_else(ATB_use == "Unknown", "No", ATB_use)) %>%
+  mutate(PPI_use = if_else(ATB_use == "Unknown", "No", PPI_use))  %>%
+  left_join(clinical.data) %>%
+  mutate(sample_id = Sample) %>%
+  column_to_rownames("sample_id") %>%
+  mutate(Response = fct_relevel(Response, "Non-responder")) %>%
+  mutate(Study = "DRUP") %>%
+  mutate(abx = ATB_use) %>%
+  mutate(lymphnode = if_else(biopsysite == "Lymph node", "LN", "nonLN")) %>%
+  write_csv("output/data/drup-gut-sampledata.csv")
+
+# Make phyloseq objects
+pseq.reads = make_phyloseq4(table_fn = metaphlan.files,
+                            sampledata = drup.metadata) %>%
+  subset_samples(Response != "MISSING") %>%
+  subset_samples(Response != "FOLLOWS") %>%
+  subset_samples(Response != "NE") %>%
+  subset_samples(msStatus != "MSS") %>%
+  prune_samples(sample_sums(.)>0, .) %>%
+  prune_taxa(taxa_sums(.)>0, .) %>%
+  subset_samples(patientId != "DRUP01290005") %>% # Remove patient with T1 missing. 
+  subset_taxa(Kingdom == "Bacteria")
+saveRDS(pseq.reads, 'output/data/pseq.reads.rda')
+
+# Collapse to species-level
+pseq.species = pseq.reads %>%
+  aggregate_taxa("Species") %>%
+  core(detection = 1/100, prevalence = 5/100, include.lowest = T)
+saveRDS(pseq.species, 'output/data/pseq.species.rda')
+```
+
+Read species files:
+```{r}
+pseq.reads <- read_rds('output/data/pseq.reads.rda')
+pseq.species <- read_rds('output/data/pseq.species.rda')
+
+taxa.info = pseq.reads %>%
+  aggregate_taxa("Species") %>%
+  tax_table() %>%
+  as.data.frame()
+```
+
+
+# Functional Dysbiosis. 
+Figures 1C and 1D
+```{r}
+sample_data(pseq.species)$response2 = sample_data(pseq.species)$Response
+
+## Load eggnog data
+drup.eggnog = import_metacyc("../workflows/biobakery/results/humann/regroup/eggnog_families.txt", meta(pseq.species), type = "kegg", taxonomy = F)
+
+# Import metadata
+healthy.questions = read_csv("../../microbeICB/studies/healthy_500fg/FG500_public_data_2022-11-18_13_12_11.csv") %>% 
+  janitor::clean_names() %>% 
+  rename(age = wat_is_uw_leeftijd_jaar,
+         host_subject_id = x500fg_identifier) %>% 
+  rename(sex = wat_is_uw_geslacht,
+         contraception = gebruikt_u_de_pil_als_anticonceptiemiddel,
+         smoking = bent_u_een_roker_of_een_roker_geweest)
+
+# Create metadata table
+healthy.metadata = read_csv("../../microbeICB/studies/healthy_500fg/SraRunTable_n300.csv") %>% 
+  janitor::clean_names() %>% 
+  mutate(sample_id = run) %>% 
+  dplyr::left_join(healthy.questions) %>% 
+  mutate(Study = "Healthy",
+         Response = "Healthy",
+         timepoint = "Healthy") %>% 
+  column_to_rownames("sample_id")
+
+healthy.eggnog = import_metacyc("../../microbeICB/studies/healthy_500fg/results/humann/eggnog_families.txt", healthy.metadata, type = "kegg", taxonomy = F)
+
+drup.merged = drup.eggnog %>% 
+  subset_samples(timepoint != "T3") %>% 
+  merge_phyloseq(healthy.eggnog, .) %>% 
+  subset_taxa(Species %in% intersect(taxa_names(healthy.eggnog), taxa_names(drup.eggnog))) %>% 
+  microbiome::transform("clr") 
+
+# Add column of metadata 
+sample_data(drup.merged)$Type = meta(drup.merged) %>% 
+  mutate(Type = if_else(Study == "Healthy", "500FG", "DRUP")) %>% 
+  pull(Type)
+
+# Compute dysbiosis
+drup.dist.mat <- phyloseq::distance(drup.merged, "euclidean")
+
+drup.dysbiosis <- dysbiosisR::euclideanDistCentroids(drup.merged,
+                                                     dist_mat = drup.dist.mat,
+                                                     use_squared = TRUE,
+                                                     group_col = "Type",
+                                                     control_label = "500FG",
+                                                     case_label = "DRUP") %>% 
+  filter(Type != "500FG") %>%
+  mutate(dysbiosis = scale(CentroidDist_score)[,1])
+
+write_csv(drup.dysbiosis, "output/data/drup-functional-dysbiosis.csv")
+
+# Compute analysis (T1)
+drup.dysbiosis %>% 
+  filter(!is.na(timepoint)) %>% 
+  mutate(Timepoint = if_else(timepoint == "T1", "Baseline", "On-treatment")) %>% 
+  mutate(Response = fct_relevel(Response, "Non-responder")) %>% 
+  mutate(Timepoint = fct_relevel(Timepoint, "Baseline")) %>% 
+  filter(timepoint == "T1") %>% 
+  lm(dysbiosis ~ Response + tumor_groups + ATB_use, data = .) %>%
+  broom::tidy()
+
+# Compute analysis (T2)
+drup.dysbiosis %>% 
+  filter(!is.na(timepoint)) %>% 
+  mutate(Timepoint = if_else(timepoint == "T1", "Baseline", "On-treatment")) %>% 
+  mutate(Response = fct_relevel(Response, "Non-responder")) %>% 
+  mutate(Timepoint = fct_relevel(Timepoint, "Baseline")) %>% 
+  filter(timepoint == "T2") %>% 
+  lm(dysbiosis ~ Response + tumor_groups + ATB_use , data = .) %>%
+  broom::tidy()
+
+# Compute analysis (Delta)
+drup.dysbiosis %>% 
+  filter(!is.na(timepoint)) %>% 
+  pivot_wider(id_cols = patientId, names_from = timepoint, values_from = dysbiosis) %>% 
+  mutate(diff = T2 - T1) %>% 
+  filter(!is.na(diff)) %>% 
+  left_join(select(meta(drup.eggnog), patientId, tumor_groups, timepoint, ATB_use, PPI_use, Response, age) %>%
+              filter(timepoint == "T1")) %>%
+  mutate(response = if_else(Response == "Responder", 1, 0)) %>% 
+  # glm(response ~ diff + tumor_groups + ATB_use, data = ., family="binomial") %>% 
+  lm(diff ~ Response + tumor_groups + ATB_use , data = .) %>%
+  tidy()
+
+# T1 / T2 plot
+bracket_data <- drup.dysbiosis %>%
+  filter(!is.na(timepoint)) %>%
+  mutate(Timepoint = if_else(timepoint == "T1", "Baseline", "On-treatment")) %>%
+  mutate(pval = ifelse(timepoint == "T1", "p=0.027", "p=0.007")) %>%
+  distinct(Timepoint, pval) %>%
+  mutate(xmin = 1, xmax = 2, y.position = c(2.55, 2.55))
+
+drup.dysbiosis.plot <- drup.dysbiosis %>% 
+  filter(!is.na(timepoint)) %>% 
+  mutate(Timepoint = if_else(timepoint == "T1", "Baseline", "On-treatment")) %>% 
+  mutate(response2 = fct_relevel(response2, "Non-responder")) %>% 
+  mutate(Timepoint = fct_relevel(Timepoint, "Baseline")) %>% 
+  select(-Response) %>% 
+  rename(Response = response2) %>% 
+  ggplot(aes(x = Response, y = dysbiosis)) +
+  stat_boxplot(geom='errorbar', linetype=1, width=0.15) +
+  geom_boxplot(aes(fill = Response)) +
+  theme_classic(base_size = 10.5) +
+  ggpubr::geom_bracket(data = bracket_data,
+                       aes(xmin = xmin, xmax = xmax, label = pval, y.position = y.position),
+                       label.size = 4) +
+  scale_x_discrete(labels = c('NR', 'R')) +
+  facet_grid(. ~ Timepoint) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c("Non-responder" = "darkred", "Responder" = "darkgreen")) +
+  xlab("") +
+  ylab("Functional dysbiosis")
+
+# Delta plots
+drup.delta = drup.dysbiosis %>% 
+  filter(!is.na(timepoint)) %>% 
+  mutate(Timepoint = if_else(timepoint == "T1", "Baseline", "On-treatment")) %>% 
+  mutate(Response = fct_relevel(Response, "Non-responder")) %>% 
+  mutate(Timepoint = fct_relevel(Timepoint, "Baseline")) %>% 
+  pivot_wider(id_cols = patientId, names_from = timepoint, values_from = dysbiosis) %>% 
+  mutate(diff = T2 - T1) %>% 
+  filter(!is.na(diff)) %>% 
+  left_join(select(meta(drup.eggnog), patientId, tumor_groups, timepoint, ATB_use, PPI_use, Response, age) %>% filter(timepoint == "T1")) %>% 
+  ggplot(aes(x = Response, y = diff)) +
+  stat_boxplot(geom='errorbar', linetype=1, width=0.15) +
+  geom_boxplot(aes (fill = Response)) +
+  theme_classic(base_size = 10.5) +
+  # ggpubr::rotate_x_text(90) +
+  # ggpubr::stat_compare_means(comparisons = list(c("Non-responder", "Responder"))) +
+  ggpubr::geom_bracket(label = "p=0.016", y.position = 2.65, xmin = 1, xmax = 2, label.size = 4) +
+  scale_x_discrete(labels=c('NR', 'R')) +
+  guides(fill = F) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c("Non-responder" = "darkred", "Responder" = "darkgreen")) +
+  xlab("") +
+  ylab("Difference in dysbiosis")
+
+
+p = (drup.dysbiosis.plot) | (drup.delta) + plot_layout(guides = "collect") & theme(legend.position = "right")
+p
+ggsave("output/figures/drup-dysbiosis-plot.pdf", p, width = 6.5, height = 5.5)
+```
+
+
+Addition of the healthy cohort in the plot. 
+Figure 3B
+```{r}
+drup.merged.tse = drup.eggnog %>% 
+  subset_samples(timepoint != "T3") %>% 
+  merge_phyloseq(healthy.eggnog, .) %>% 
+  subset_taxa(Species %in% intersect(taxa_names(healthy.eggnog), taxa_names(drup.eggnog))) %>% 
+  mia::makeTreeSummarizedExperimentFromPhyloseq(.)
+
+drup.merged.tse <- mia::transformAssay(drup.merged.tse, method = "clr", pseudocount = TRUE)
+
+# Run dimensionality reduction:
+drup.merged.tse <-runPCA(drup.merged.tse,
+              assay.type = "clr",
+              scale = FALSE,
+              ntop = dim(drup.merged.tse)[1],
+              name = "PCA_all")
+
+# Join dysbiosis:
+colData(drup.merged.tse) = colData(drup.merged.tse) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "rownames") %>% 
+  dplyr::left_join(select(drup.dysbiosis, Sample, dysbiosis)) %>% 
+  column_to_rownames("rownames") %>% 
+  DataFrame()
+
+pca_all_scatter <- reducedDim(drup.merged.tse, "PCA_all") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("SampleId") %>% 
+  left_join(colData(drup.merged.tse) %>% as.data.frame() %>% rownames_to_column(var = "SampleId")) %>% 
+  mutate (dysbiosis = as.numeric (dysbiosis)) %>% 
+  ggplot (aes (-PC1, -PC2)) + 
+  geom_point (data = . %>% filter (Response == "Healthy"), 
+              color = "#F4A261", 
+              alpha = 0.6,
+              size = 3) +
+  geom_point (data = . %>% filter (Response != "Healthy"),
+              aes (color = dysbiosis), size = 3) +
+  theme_few() + 
+  annotate("text", x = -50, y = 325, label = "Healthy\nreference", color = "#F4A261", size = 4.5) +
+  labs (x = "PCA 1 (11%)",
+        y = "PCA 2 (6%)",
+        color = "Functional\ndysbiosis") +
+  scale_color_viridis_c() 
+pca_all_scatter
+
+ggsave("output/figures/pca_dysbiosis_drup.pdf", pca_all_scatter, width = 5.5, height = 4)
+
+
+```
+
+
+
+
+### Tumor-types
+Differences depending on tumor type origin dysbiosis.  
+Figures S2D and S2E
+```{r}
+dysbiosis_tumor_class <- drup.dysbiosis %>% 
+  mutate (tumor_class = ifelse (tumor_groups %in% c("CRC", "Other-GI"), tumor_groups, "Other-non-GI")) %>% 
+  ggplot (aes (x = tumor_class, y = dysbiosis)) +
+  geom_boxplot(aes (fill = tumor_class)) +
+  geom_quasirandom() +
+  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_text(color = "black", size = 13)) +
+  labs(x = NULL,
+       y = "Functional dysbiosis",
+       fill = "Tumor class") +
+  stat_compare_means() +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous( expand = c(0, 0.5)) +
+  EnvStats::stat_n_text() 
+
+dysbiosis_tumor_class_response <- drup.dysbiosis %>% 
+  mutate (tumor_class = ifelse (tumor_groups %in% c("CRC", "Other-GI"), tumor_groups, "Other-non-GI")) %>% 
+  mutate (Response3 = recode (response2, 
+                              "Responder" = "R", 
+                              "Non-responder" = "NR")) %>% 
+  ggplot (aes (x = Response3, y = dysbiosis)) +
+  geom_boxplot(aes (fill = Response3)) +
+  facet_grid(~tumor_class) +
+  geom_quasirandom() +
+  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_text(color = "black", size = 11)) +
+  geom_signif(
+    comparisons = list(
+      c("NR", "R")
+    ),
+    textsize = 4,
+    step_increase = 0.05,
+    tip_length = 0.01,
+    orientation = "x",
+    map_signif_level = function(p) {
+      if (p < 0.001) {
+        return("p < 0.001")
+      } else {
+        return(sprintf("p = %.3f", p))
+      }
+    }
+  ) +
+  labs(x = NULL,
+       y = "Functional dysbiosis",
+       fill = "Response") +
+  scale_fill_manual(values = c("NR" = "darkred", "R" = "darkgreen")) +
+  scale_y_continuous( expand = c(0, 0.5)) +
+  EnvStats::stat_n_text() 
+
+# Save plots:
+patch_dysbiosis_tumor_class <- dysbiosis_tumor_class / dysbiosis_tumor_class_response
+patch_dysbiosis_tumor_class
+ggsave ("output/figures/dysbiosis_tumor_class.pdf", patch_dysbiosis_tumor_class, height = 9, width = 7)
+
+```
+
+
+
+### Pathways associated with dysbiosis
+Figure S2G
+```{r}
+dryp.dysbiosis <- read_csv ("output/data/drup-functional-dysbiosis.csv")
+
+# What are the pathways that associate with dysbiosis.
+dysbiosis_groups <- dryp.dysbiosis %>% 
+  mutate (dysbiosis_group = case_when(
+    dysbiosis < quantile(dysbiosis, 1/3) ~ "Eubiosis", 
+    dysbiosis > quantile (dysbiosis, 2/3) ~ "Dysbiosis",
+    .default = "Low dysbiosis"
+    )) %>% 
+  select (Sample, dysbiosis, dysbiosis_group)
+
+## Load Derosa et al 2024 pathways from bacteria of each cluster. 
+derosa_pathways_clusters <- readxl::read_xlsx("../../resources/1-s2.0-S0092867424005385-mmc5.xlsx", sheet = 4, skip = 3) %>% 
+  rename (Cluster = Bacteria) %>% 
+  mutate (Name = Pathway)
+
+# Fold change DRUP samples
+metacyc_fold_change <- metacyc.pseq %>% 
+  core(detection = 1/1000, prevalence = 25/100) %>% 
+  psmelt() %>% 
+  left_join (dysbiosis_groups) %>% 
+  filter (dysbiosis_group != "Low dysbiosis") %>% 
+  group_by(OTU, dysbiosis_group) %>% 
+  summarise(mean = mean(Abundance)) %>% 
+  pivot_wider(names_from = "dysbiosis_group", values_from = "mean") %>% 
+  mutate (`Dysbiosis/Eubiosis` = (Dysbiosis / Eubiosis), 
+          `log(Dysbiosis/Eubiosis)` = log(`Dysbiosis/Eubiosis`),
+          `Eubiosis/Dysbiosis` = (Eubiosis / Dysbiosis), 
+          `log(Eubiosis/Dysbiosis)` = log(`Eubiosis/Dysbiosis`)) %>% 
+   left_join(metacyc.names, by = c("OTU" = "ID")) 
+  
+lfc_correlation <- derosa_pathways %>% 
+  dplyr::inner_join(metacyc_fold_change, by = c("Pathway" = "name")) %>% 
+  ggplot (aes (y = `Fold_Change_SIG2+/SIG1+`, x = `log(Eubiosis/Dysbiosis)`)) +
+  geom_smooth(method = "lm") +
+  geom_point(size = 3, fill = "#A7CEE2", shape = 21) +
+  stat_cor( size = 5) +
+  theme_few(base_size = 14)  +
+  labs (x = "log(Low dysbiosis /High dysbiosis) DRUP",
+        y = "log(SIG2+/SIG1+), Derosa et al, 2024", 
+        subtitle = "Metacyc pathways")
+
+lfc_correlation
+ggsave ("output/figures/derosa_lfc_pathways.pdf", lfc_correlation, height = 4.5, width = 5.5)
+
+```
+
+# HUMAnN3
+
+```{r}
+drup.metadata <- read_csv("output/data/drup-gut-sampledata.csv")
+
+# Metacyc
+metacyc.pseq = import_metacyc(table = "../workflows/biobakery/results/humann/pathway_abundance.txt", 
+                              sampledata = drup.metadata %>% column_to_rownames("Sample"), 
+                              taxonomy = F, exclude = T) %>% 
+  subset_samples(Response != "MISSING") %>% 
+  subset_samples(Response != "FOLLOWS") %>% 
+  subset_samples(Response != "NE") %>% 
+  subset_samples(msStatus != "MSS") %>% 
+  prune_samples(sample_sums(.)>0, .) %>% 
+  prune_taxa(taxa_sums(.)>0, .) %>% 
+  subset_samples(patientId != "DRUP01290005")
+
+metacyc.cpm.pseq = import_metacyc(table = "../workflows/biobakery/results/humann/pathway_abundance-cpm.txt", 
+                              sampledata = drup.metadata %>% column_to_rownames("Sample"), 
+                              taxonomy = F, exclude = T) %>% 
+  subset_samples(Response != "MISSING") %>% 
+  subset_samples(Response != "FOLLOWS") %>% 
+  subset_samples(Response != "NE") %>% 
+  subset_samples(msStatus != "MSS") %>% 
+  prune_samples(sample_sums(.)>0, .) %>% 
+  prune_taxa(taxa_sums(.)>0, .) %>% 
+  subset_samples(patientId != "DRUP01290005")
+
+metacyc.pseq %>%
+  saveRDS("output/data/drupgut-metacyc.rda")
+
+metacyc.cpm.pseq %>%
+  saveRDS("output/data/drupgut-metacyc-cpm.rda")
+
+# Import eggnog families
+eggnog.families = import_metacyc("../workflows/biobakery/results/humann/regroup/eggnog_families.txt",
+                                 sampledata = meta(metacyc.pseq), type = "kegg", taxonomy = F)
+eggnog.families %>% saveRDS("output/data/drupgut-eggnog.families.rda")
+```
+
+
+Densities plots:
+Figures S3C, S3D, S3E and S3F
+```{r}
+library (mia)
+tse.metacyc.pseq <- metacyc.pseq %>% 
+  convertFromPhyloseq() %>% 
+  addAlpha(
+    assay.type = "counts",
+    index = "observed_richness")
+
+num.pathways.plot <- tse.metacyc.pseq %>% 
+  colData() %>% 
+  as_tibble() %>% 
+  filter (observed_richness > 150) %>% 
+  ggplot(aes(x = observed_richness)) +
+  geom_density(alpha = 0.50, fill = "#3CB371") +
+  # geom_boxplot(alpha = 0.5) +
+  theme_few(base_size = 10) +
+  theme(legend.position = "none",
+        legend.title = element_blank()) +
+  xlab("Metacyc pathways") +
+  ylab("Density")
+
+
+tse.eggnog.families <- eggnog.families %>% 
+  convertFromPhyloseq() %>% 
+  addAlpha(
+    assay.type = "counts",
+    index = "observed_richness")
+
+num.eggnog.plot <- tse.eggnog.families %>% 
+  colData() %>% 
+  as_tibble() %>% 
+  filter (observed_richness > 4000) %>%
+  ggplot(aes(x = observed_richness)) +
+  geom_density(alpha = 0.50, fill = "#3CB371") +
+  # geom_boxplot(alpha = 0.5) +
+  theme_few(base_size = 10) +
+  theme(legend.position = "none",
+        legend.title = element_blank()) +
+  xlab("EggNOG orthologs") +
+  ylab("Density")
+
+# Plot distribution of sequencing depth
+num.reads.plot = humann.report %>% 
+  mutate(depth = (total_reads * 150) / 1000000000) %>% 
+  ggplot(aes(x = total_reads)) +
+  geom_density(alpha = 0.50, fill = "#3CB371") +
+  theme_few(base_size = 10) +
+  scale_fill_lancet() +
+  theme(legend.position = c(0.75, 0.80),
+        legend.title = element_blank()) +
+  scale_x_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  xlab("Reads per sample") +
+  ylab("Density")
+
+# Plot distribution of species
+num.sp.plot = humann.report %>% 
+  ggplot(aes(x = total_species)) +
+  geom_density(alpha = 0.50, fill = "#3CB371") +
+  theme_few(base_size = 10) +
+  # scale_fill_lancet() +
+  theme(legend.position = "none",
+        legend.title = element_blank()) +
+  xlab("Species") +
+  ylab("Density")
+
+patch_density <- num.reads.plot +
+  num.sp.plot + 
+  num.pathways.plot +
+  num.eggnog.plot +
+  plot_layout(guides = "collect")
+
+patch_density
+
+ggsave ("output/figures/density_all_drup.pdf", patch_density, width = 10, height = 4)
+
+```
+
+
+```{r}
+# Read metacyc file:
+metacyc.pseq <- read_rds ("output/data/drupgut-metacyc.rda")
+```
+
+
+### Metacyc pathway
+```{r}
+metacyc.lme = metacyc.pseq %>% 
+  subset_samples(timepoint != "T3") %>%
+  core(detection = 1/1000, prevalence = 15/100) %>% 
+  transform_sample_counts(function(x) x + 0.01) %>% 
+  microbiome::transform(transform = "clr") %>% 
+  psmelt() %>% 
+  nest_by(OTU) %>% 
+  summarise(res = list(broom::tidy(lmerTest::lmer(Abundance ~ Response*time + tumor_groups + ATB_use + (1|patientId), data = data)))) %>% 
+  unnest() %>% 
+  ungroup() %>% 
+  filter(term == "ResponseResponder:time") %>% 
+  mutate(q_val = p.adjust(p.value, method = "fdr")) %>% 
+  left_join(metacyc.names, by = c("OTU" = "ID"))
+
+#Save table of results
+metacyc.lme %>% 
+  arrange (p.value) %>% 
+  rename (ID = OTU) %>% 
+  left_join(., metacyc.names) %>% 
+  relocate(name, .after = 1) %>% 
+  rename (metacyc_id = ID) %>% 
+  mutate (Increased_in = ifelse (estimate > 0, "Responder", "Non-responder")) %>%
+  write_csv("output/tables/metacyc_pathways_drup_lme.csv")
+```
+
+#####HMBPP
+HMBPP plots
+Figure 3D
+```{r}
+
+# Make MA plot
+metacyc.basemean = metacyc.pseq %>% 
+  subset_samples(timepoint != "T3") %>% 
+  subset_taxa(Species != "UNGROUPED") %>% 
+  microbiome::transform("compositional") %>% 
+  transform_sample_counts(function(x) x * 1E6) %>% 
+  taxa_sums() %>% 
+  as.data.frame() %>% 
+  janitor::clean_names() %>% 
+  rename(baseMean = x) %>% 
+  rownames_to_column("feature")
+  
+temp = metacyc.lme %>% 
+  left_join(metacyc.basemean, by = c("OTU" = "feature")) %>% 
+  mutate(Significance = if_else(p.value < 0.05, "P<0.05", "P>0.05"))
+  
+
+metacyc.ma = temp %>% 
+  ggplot(aes(x = log10(baseMean), y = estimate, color = Significance)) +
+  geom_point() +
+  geom_point(data = . %>% filter (p.value > 0.05), color = "gray") +
+  ggrepel::geom_text_repel(aes(label = OTU), data = filter(temp, OTU %in%  c( "PWY-7560", "PWY-5121")),
+                           size = 3.5, 
+                           nudge_x = 0.15,
+                           box.padding = 0.5,
+                           nudge_y = 1.5,
+                           segment.curvature = -0.1,
+                           segment.ncp = 3,
+                           segment.angle = 20
+  ) +
+  ggrepel::geom_text_repel(aes(label = OTU), data = filter(temp, OTU %in%  c("NONMEVIPP-PWY")),
+                           color = "black",
+                           size = 3.5, 
+                           nudge_x = 0.15,
+                           box.padding = 0.5,
+                           nudge_y = -1.25,
+                           segment.curvature = 0.1,
+                           segment.ncp = 3,
+                           segment.angle = 20
+  ) +
+  geom_point(data = filter(temp, OTU %in% c("NONMEVIPP-PWY", "PWY-7560", "PWY-5121")),
+             color = "black", size = 3.5) +
+  geom_point(data = filter(temp, OTU %in% c("NONMEVIPP-PWY", "PWY-7560", "PWY-5121")),
+            size = 2.5) +
+  theme_few() +
+  xlim(3.5, 6.5) +
+  scale_color_manual(values = c("P>0.05" = "gray", "P<0.05" = "red")) +
+  theme(legend.position = c(0.85, 0.1), legend.title = element_blank()) +
+  xlab("Base mean (CPM [log10])") +
+  ylab("CLR difference")
+
+metacyc.ma
+ggsave("output/figures/drup-ma-plot-hmbpp.pdf", metacyc.ma, width = 4, height = 4)
+
+```
+
+
+Dysbiosis and Non-Mep pathways. 
+
+Figures 3E, 3F and 3G
+```{r}
+
+drup.dysbiosis = read_csv("output/data/drup-functional-dysbiosis.csv") %>% 
+  select (Sample, dysbiosis)
+
+hmbpp_pathway_rela <- metacyc.cpm.pseq %>% 
+  transform_sample_counts(function(x) x + 0.01) %>% 
+  microbiome::transform(transform = "compositional") %>% 
+  subset_taxa(Species %in% c("NONMEVIPP-PWY", "PWY-7560", "PWY-5121")) %>% 
+  psmelt() 
+
+p_list <- sapply(c("NONMEVIPP-PWY", "PWY-7560", "PWY-5121"), function(pathway) {
+  hmbpp_pathway_rela %>% 
+    left_join (drup.dysbiosis) %>% 
+    filter (OTU == pathway) %>% 
+    ggplot (aes (Abundance, dysbiosis)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    stat_cor(label.x.npc = "center") +
+    labs (x = "Relative abundance pathway",
+          y = "Functional dysbiosis",
+          subtitle = pathway) +
+    theme_bw(base_size = 14) 
+},simplify = F, USE.NAMES = T)
+
+wp <- wrap_plots(p_list, ncol = 3, guides = "collect") +
+  plot_layout(axis_titles = "collect")
+
+wp
+
+ggsave("output/figures/hmbpp_pathway_cor_dysbiosis.pdf", wp,  width = 11.5, height = 4)
+```
+
+
+#### Riboflavin
+Figure 5a
+```{r}
+# Make volcano plot
+drup.metacyc.volcano.b2 = metacyc.lme %>% 
+  ggplot(aes(x = estimate, y = -log10(p.value))) +
+  geom_hline(yintercept = -log10(0.05), linetype = 20, alpha = 0.50) +
+  geom_point(color = "gray", alpha = 0.75) +
+  ggrepel::geom_text_repel(aes(label = OTU), data = . %>% filter(OTU %in%  c("PWY-6167", "PWY-6168")), size = 3.5, 
+                           nudge_x = 0.15,
+    box.padding = 0.5,
+    segment.curvature = -0.1,
+    segment.ncp = 3,
+    segment.angle = 20) +
+  geom_point(data = filter(metacyc.lme, OTU %in% c("PWY-6167", "PWY-6168")), color = "red", size = 3.5) +
+  theme_few() +
+  geom_vline(xintercept = 0, linetype = 20, alpha = 0.5) +
+  xlab("Coefficent") +
+  ylab("-lo10(p-value)")
+
+drup.metacyc.volcano.b2
+
+ggsave("output/figures/drup-vp-plot-riboflavin.pdf", drup.metacyc.volcano.b2, width = 3, height = 4)
+```
+
+
+Dysbiosis and Riboflavin pathways. 
+
+```{r}
+
+drup.dysbiosis = read_csv("output/data/drup-functional-dysbiosis.csv") %>% 
+  select (Sample, dysbiosis)
+
+riboflavin_pathway_rela <- metacyc.cpm.pseq %>% 
+  microbiome::transform(transform = "compositional") %>% 
+  subset_taxa(Species %in% c("PWY-6167", "PWY-6168", "PWY-8112", "RIBOSYN2-PWY")) %>% 
+  psmelt()
+
+p_list <- sapply(c("PWY-6167", "PWY-6168", "PWY-8112", "RIBOSYN2-PWY"), function(pathway) {
+  riboflavin_pathway_rela %>% 
+    left_join (drup.dysbiosis) %>% 
+    filter (OTU == pathway) %>% 
+    ggplot (aes (Abundance, dysbiosis)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    stat_cor(label.x.npc = "center") +
+    labs (x = "Relative abundance pathway",
+          y = "Functional dysbiosis",
+          title = pathway) +
+    theme_bw(base_size = 14) 
+},simplify = F, USE.NAMES = T)
+
+p_list
+
+wp <- wrap_plots(p_list[1:3], ncol = 3, guides = "collect") +
+  plot_layout(axis_titles = "collect")
+
+wp
+
+ggsave("output/figures/riboflavin_pathway_cor_dysbiosis.pdf", wp,  width = 11.5, height = 4)
+
+```
+
+
+
+# Dysbiosis and immune signatures.
+
+Figure S7A
+```{r}
+drup.dysbiosis <- read_csv ("output/data/drup-functional-dysbiosis.csv")
+
+dysbiosis.immune = drup.dysbiosis %>% 
+  filter(timepoint == "T1") %>% 
+  select(sampleId, dysbiosis) %>% 
+  inner_join(select(immune_signatures, sampleId, mait, alpha_beta_t_cells, cd4_t_cells, cd8_t_cells, dc, eosinophils, exhausted_cd8, macrophages, mast_cells, neutrophils, nk_cells, th1_cells, gamma_delta_1_and_3_t_cell_signature_van_de_haar_et_al, gamma_delta_2, b_cells, t_cells)) %>% 
+  pivot_longer(cols = -c(sampleId, dysbiosis)) %>% 
+  left_join(meta(metacyc.pseq) %>% filter(timepoint == "T1")) %>% 
+  left_join(select(immune_signatures, sampleId, cd45)) %>% 
+  mutate(lymphnode = if_else(biopsySite == "Lymph node", "LN", "nonLN")) %>% 
+  nest_by(name) %>% 
+  summarise(res = list(broom::tidy(lm(dysbiosis ~ value + tumor_groups + ATB_use + lymphnode + Response + cd45, data = data)))) %>% 
+  unnest() %>% 
+  filter(term == "value") %>% 
+  ungroup() %>% 
+  mutate(fdr = p.adjust(p.value, "fdr")) %>% 
+  mutate(log10.pval = -log10(p.value)) %>% 
+  mutate(name = as.factor(name)) %>% 
+  mutate(name = fct_recode(name,
+                           "γδ1/γδ3 cells" = "gamma_delta_1_and_3_t_cell_signature_van_de_haar_et_al",
+                           "γδ2 cell" = "gamma_delta_2",
+                           "Macrophages" = "macrophages",
+                           "CD8 T-cells" = "cd8_t_cells",
+                           "α/β T-cells" = "alpha_beta_t_cells",
+                           "Eosinophils" = "eosinophils",
+                           "B cells" = "b_cells",
+                           "Mast cells" = "mast_cells",
+                           "CD4 T-cells" = "cd4_t_cells",
+                           "Cytotoxic cells" = "cytotoxic_cells",
+                           "Th1 cells" = "th1_cells",
+                           "MAIT" = "mait",
+                           "Treg" = "treg",
+                           "T-cells" = "t_cells",
+                           "Exhausted CD8" = "exhausted_cd8",
+                           "NK cells" = "nk_cells",
+                           "NK-dim cells" = "nk_cd56dim_cells",
+                           "DC" = "dc",
+                           "Neutrophils" = "neutrophils"
+                           )) 
+
+# Make volcano plot
+dysbiosis.immune.plot = dysbiosis.immune %>% 
+  ggplot(aes(x = estimate, y = log10.pval, label = name)) +
+  geom_hline(yintercept = 1.3, alpha = 0.50, linetype = "dashed") +
+  geom_vline(xintercept = 0, alpha = 0.50, linetype = "dashed") +
+  geom_label_repel(size = 5.5) +
+  geom_point(size = 4, alpha = 0.50) +
+  geom_point(data = filter(dysbiosis.immune, log10.pval >= 1.3), size = 4.5, alpha = 0.50, color = "red") +
+  theme_classic2(base_size = 14) +
+  xlab("Association to functional dysbiosis (coefficient)") +
+  ylab("-log10(P-value)")
+
+dysbiosis.immune.plot
+
+```
+
+
+Figures 5C and 5D
+```{r}
+
+#Abis deconvolution
+complete.msicohort %>% 
+  inner_join(abis) %>% 
+  inner_join(select(immune_signatures, sampleId, cd45)) %>%
+  pivot_longer(cols = colnames(abis)[-1]) %>% 
+  nest_by(name) %>% 
+  summarise(res = list(broom::tidy(glm(cb_16_weeks ~ value + tumor_groups + lymphnode + cd45, data = data, family = "binomial"), exponetiate = T, conf.int = T))) %>% 
+  unnest() %>% 
+  filter(term == "value") %>% 
+  mutate(p.value = round(p.value, 4)) %>% 
+  arrange (p.value)
+
+# Danaher signature
+complete.msicohort %>% 
+  select(sampleId, cb_16_weeks, tumor_groups, lymphnode, cohort) %>%
+  inner_join(select(immune_signatures, sampleId, mait, alpha_beta_t_cells, cd4_t_cells, cd8_t_cells, dc, eosinophils, exhausted_cd8, macrophages, mast_cells, neutrophils, nk_cells, th1_cells, gamma_delta_1_and_3_t_cell_signature_van_de_haar_et_al, gamma_delta_2, b_cells, t_cells)) %>% 
+  pivot_longer(cols = -c(sampleId, cb_16_weeks, tumor_groups, lymphnode, cohort)) %>% 
+  inner_join(select(immune_signatures, sampleId, cd45)) %>%
+  nest_by(name) %>% 
+  summarise(res = list(broom::tidy(glm(cb_16_weeks ~ value + tumor_groups + lymphnode + cd45, data = data, family = "binomial"), exponetiate = T, conf.int = T))) %>% 
+  unnest() %>% 
+  filter(term == "value") %>% 
+  mutate(p.value = round(p.value, 4)) %>% 
+  arrange (p.value)
+
+# Make plot
+mait.msi.plot = complete.msicohort %>% 
+  inner_join(immune_signatures) %>% 
+  mutate(cb_16_weeks_fct = fct_relevel(cb_16_weeks_fct, "NCB")) %>% 
+  ggplot(aes(x = cb_16_weeks_fct, y = mait, fill = cb_16_weeks_fct)) +
+  stat_boxplot(geom = "errorbar", width = 0.15) + 
+  geom_boxplot(outlier.alpha = 0.50, width = 0.50, outliers = FALSE) +
+  theme_few(base_size = 11) +
+  scale_fill_manual(values = c("CB" = "#166B2A", "NCB" = "#C22A44")) +
+  guides(fill = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.10))) +
+  theme(legend.position = "none") +
+  geom_quasirandom(alpha = 0.3, size = 0.7) + 
+  geom_signif(comparisons = list(c("CB", "NCB")),
+              y_position = 4.5, annotation = "p=0.057", textsize = 4) +
+  xlab("") +
+  ylab("MAIT cells") 
+
+mait.msi.plot.abis = complete.msicohort %>% 
+  inner_join(abis) %>% 
+  mutate(cb_16_weeks_fct = fct_relevel(cb_16_weeks_fct, "NCB")) %>% 
+  ggplot(aes(x = cb_16_weeks_fct, y = t_cell_mait, fill = cb_16_weeks_fct)) +
+  stat_boxplot(geom = "errorbar", width = 0.15) + 
+  geom_boxplot(outlier.alpha = 0.50, width = 0.50, outliers = FALSE) +
+  theme_few(base_size = 11) +
+  scale_fill_manual(values = c("CB" = "#166B2A", "NCB" = "#C22A44")) +
+  guides(fill = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.10))) +
+  theme(legend.position = "none") +
+  geom_quasirandom(alpha = 0.3, size = 0.7) + 
+  geom_signif(comparisons = list(c("CB", "NCB")),
+              y_position = 1.5, annotation = "p=0.006", textsize = 4) +
+  xlab("") +
+  ylab("MAIT cells (Abis)") 
+
+th1.msi.plot = complete.msicohort %>% 
+  inner_join(immune_signatures) %>% 
+  mutate(cb_16_weeks_fct = fct_relevel(cb_16_weeks_fct, "NCB")) %>% 
+  ggplot(aes(x = cb_16_weeks_fct, y = th1_cells, fill = cb_16_weeks_fct)) +
+  stat_boxplot(geom = "errorbar", width = 0.15) + 
+  geom_boxplot(outlier.alpha = 0.50, width = 0.50, outliers = FALSE) +
+  theme_few(base_size = 11) +
+  scale_fill_manual(values = c("CB" = "#166B2A", "NCB" = "#C22A44")) +
+  guides(fill = "none") +
+  geom_quasirandom(alpha = 0.3, size = 0.7) + 
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.1))) +
+  theme(legend.position = "none") +
+  geom_signif(comparisons = list(c("CB", "NCB")),
+              y_position = 4.5, annotation = "p=0.16", textsize = 4) +
+  xlab("") +
+  ylab("Th1 cells (Danaher)") 
+
+p
+
+# make plot
+p = (dysbiosis.immune.plot | (mait.msi.plot / mait.msi.plot.abis / th1.msi.plot)) + plot_layout(widths = c(2, 1)) & scale_y_continuous(expand = expansion(mult = c(0.1, 0.15)))
+
+grDevices::cairo_pdf("output/figures/immune-cell-association-msi-icb.pdf",width = 8, height = 7)
+p 
+dev.off()
+```
+
+
+
+# HMBPP pathway per bacterial species. 
+
+## Species contributing to HMBPP pathway. 
+
+Figure S4A
+```{r}
+
+derosa.pathway.txa = data.table::fread("../../microbeICB/studies/derosa_nature_2022/results/humann/pathway_abundance-cpm.txt") %>% 
+  rename(pathway = `# Pathway`) %>% 
+  filter(grepl("NONMEVIPP-PWY|PWY-7560|PWY-5121", pathway)) %>% 
+  pivot_longer(cols = -pathway) %>% 
+  group_by(pathway) %>% 
+  summarise(sum = sum(value)) %>% 
+  separate(pathway, into = c("pathway", "taxa"), sep = "\\|") %>% 
+  filter(!is.na(taxa)) %>% 
+  filter(taxa != "unclassified") 
+
+
+lee.pathway.txa = data.table::fread("../../microbeICB/studies/lee_nature_2022/results/humann/pathway_abundance-cpm.txt") %>% 
+  rename(pathway = `# Pathway`) %>% 
+  filter(grepl("NONMEVIPP-PWY|PWY-7560|PWY-5121", pathway)) %>% 
+  pivot_longer(cols = -pathway) %>% 
+  group_by(pathway) %>% 
+  summarise(sum = sum(value)) %>% 
+  separate(pathway, into = c("pathway", "taxa"), sep = "\\|") %>% 
+  filter(!is.na(taxa)) %>% 
+  filter(taxa != "unclassified") 
+
+routy.pathway.txa = data.table::fread("../../microbeICB/studies/routy_science_2018/results/humann/pathway_abundance-cpm.txt") %>% 
+  rename(pathway = `# Pathway`) %>% 
+  filter(grepl("NONMEVIPP-PWY|PWY-7560|PWY-5121", pathway)) %>% 
+  pivot_longer(cols = -pathway) %>% 
+  group_by(pathway) %>% 
+  summarise(sum = sum(value)) %>% 
+  separate(pathway, into = c("pathway", "taxa"), sep = "\\|") %>% 
+  filter(!is.na(taxa)) %>% 
+  filter(taxa != "unclassified") 
+
+mcculloch.pathway.txa = data.table::fread("../../microbeICB/studies/mcculloch_nature_2022/results/humann/pathway_abundance-cpm.txt") %>% 
+  rename(pathway = `# Pathway`) %>% 
+  filter(grepl("NONMEVIPP-PWY|PWY-7560|PWY-5121", pathway)) %>% 
+  pivot_longer(cols = -pathway) %>% 
+  group_by(pathway) %>% 
+  summarise(sum = sum(value)) %>% 
+  separate(pathway, into = c("pathway", "taxa"), sep = "\\|") %>% 
+  filter(!is.na(taxa)) %>% 
+  filter(taxa != "unclassified") 
+
+spencer.pathway.txa = data.table::fread("../../microbeICB/studies/spencer_science_2021/results/humann/pathway_abundance-cpm.txt") %>% 
+  rename(pathway = `# Pathway`) %>% 
+  filter(grepl("NONMEVIPP-PWY|PWY-7560|PWY-5121", pathway)) %>% 
+  pivot_longer(cols = -pathway) %>% 
+  group_by(pathway) %>% 
+  summarise(sum = sum(value)) %>% 
+  separate(pathway, into = c("pathway", "taxa"), sep = "\\|") %>% 
+  filter(!is.na(taxa)) %>% 
+  filter(taxa != "unclassified") 
+
+# Merge and plot
+merged.hmbpp.taxa = bind_rows(derosa.pathway.txa, lee.pathway.txa, routy.pathway.txa, mcculloch.pathway.txa, spencer.pathway.txa) %>% 
+  group_by(taxa) %>% 
+  summarise(abundance = sum(sum)) %>% 
+  mutate(rank = rank(abundance)) %>% 
+  mutate(group = if_else(taxa %in% c("g__Collinsella.s__Collinsella_aerofaciens", "g__Bacteroides.s__Bacteroides_caccae", "g__Blautia.s__Blautia_coccoides", "g__Escherichia.s__Escherichia_coli", "g__Eggerthella.s__Eggerthella_lenta"), "Tested", "nonTested")) %>% 
+  separate(taxa, into = c("Genus", "Species"), sep = "\\.")
+
+merged.hmbpp.taxa.plot = merged.hmbpp.taxa %>% 
+  ggplot(aes(x = reorder(Species, abundance), y = log10(abundance), color = group, label = Species)) +
+  geom_point() +
+  ggrepel::geom_text_repel(data = filter(merged.hmbpp.taxa, group == "Tested"), size = 3.5, box.padding = 1.5, max.overlaps = Inf) +
+  theme_few() +
+  theme(axis.text.x = element_blank(),
+        legend.position = "none") +
+  scale_color_manual(values = c("Tested" = "red", "Nontested" = "gray")) +
+  xlab("HMBPP producing Species (rank)") +
+  ylab("Counts per million (summed) [log10]")
+
+```
+
+
+## Species with no genes mapping to HMBPP pathway
+Check for species in the resource that do not have any hits for genes involved in the pathway of HMBPP. 
+Figure S4B
+```{r}
+
+hmbpp.kegg = c("K01662", "K00099", "K00991", "K00919", "K01770", "K12506", "K03526", "K03527", "K01823")
+
+#Uniref90 sequences that have the KEGG annotations of the HMBPP pathway. 
+lines <- readLines("/home/m.p.martinez/common/humann/utility_mapping/map_ko_uniref90.txt.gz")
+data_list <- strsplit(lines, "\t")
+ko2uniref90_kegg <- tibble(
+  ID = sapply(data_list, `[[`, 1),
+  Elements = lapply(data_list, function(x) x[-1])  # Remove the first ID element
+) %>% 
+  filter (ID %in% hmbpp.kegg) %>% 
+  unnest(Elements) %>% 
+  dplyr::rename(Uniref90=Elements)
+
+
+#Load gene families of the HMPBPP pathway that map to known species per study. 
+hmbpp_genes_species.derosa <- data.table::fread("../../microbeICB/studies/derosa_nature_2022/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+hmbpp_genes_species.lee <- data.table::fread("../../microbeICB/studies/lee_nature_2022/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+hmbpp_genes_species.baruch <- data.table::fread("../../microbeICB/studies/baruch_science_2021/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+hmbpp_genes_species.mcculloch <- data.table::fread("../../microbeICB/studies/mcculloch_nature_2022/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+hmbpp_genes_species.spencer <- data.table::fread("../../microbeICB/studies/spencer_science_2021/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+hmbpp_genes_species.routy <- data.table::fread("../../microbeICB/studies/routy_science_2018/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+#Join all studies
+merged.hmbpp.KO.taxa = bind_rows(hmbpp_genes_species.baruch, hmbpp_genes_species.derosa, hmbpp_genes_species.lee, hmbpp_genes_species.mcculloch, hmbpp_genes_species.routy, hmbpp_genes_species.spencer) %>% 
+  distinct (ID, Genus, Species, taxa)
+
+int.species = read_rds("../../microbeICB/integration/output/data/merge/int.species.rda")
+
+hmbpp.neg.species.abundace <- int.species %>% 
+  transform_sample_counts(function(x) { (x/sum(x)) * 1000}) %>% 
+  otu_table()  %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "Species") %>% 
+  pivot_longer(cols = -Species) %>% 
+  group_by(Species) %>% 
+  summarise(abundance = sum(value)) %>% 
+  filter (!Species %in% merged.hmbpp.KO.taxa$Species) 
+
+#Plot of the distribution of bacteria species negative for HMBPP pathway with respect to negative control used. 
+non.hmbpp.taxa.plot  <- hmbpp.neg.species.abundace %>% 
+  ggplot(aes(x = reorder(Species, abundance), y = log10(abundance), label = Species)) +
+  geom_point() +
+  geom_point(data = . %>% filter(Species == "Lactiplantibacillus_plantarum"), color = "red") +
+  ggrepel::geom_label_repel(data = . %>% filter(Species == "Lactiplantibacillus_plantarum"), size = 4.5, box.padding = 1.5, max.overlaps = Inf) +
+  theme_few(base_size = 14) +
+  theme(axis.text.x = element_blank(),
+        legend.position = "none") +
+  xlab("Non HMBPP producing Species (rank)") +
+  ylab("Counts per million (summed) [log10]") +
+  labs (subtitle = "Species with no reads mapping to MEP pathway enzymes")
+  
+ggsave ("manuscript-figures/non_hmbpp_producers.pdf", plot = non.hmbpp.taxa.plot,  width = 5, height = 5)
+
+```
+

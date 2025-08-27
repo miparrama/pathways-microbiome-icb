@@ -1,0 +1,1513 @@
+---
+title: "Harmonize"
+author: "Thomas W. Battaglia & Miguel Parra-Martinez"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library (mia)
+library(phyloseq)
+library(microbiome)
+library(patchwork)
+library(ggsci)
+library(ggthemes)
+library (ggpubr)
+library (ggbeeswarm)
+library(tidyverse)
+source("helpers.R")
+
+# Import metacyc Names
+metacyc.names = vroom::vroom("../../resources/map_metacyc-pwy_name.txt.gz", col_names = c("ID", "Name"))
+
+module_names = read_csv("../../resources/module_names.csv") %>% 
+  mutate(short_name = str_remove(Name, " =>.*$"))
+
+```
+
+# QC: 
+
+## Humann
+
+Figures S1A and S1B
+```{r}
+# Overview of counts
+humann.logs = list.files("../studies/", pattern = "-report.txt", recursive = T, full.names = T)
+names(humann.logs) = list.files("../studies/", pattern = "-report.txt", recursive = T, full.names = F) %>% 
+  basename() %>% 
+  str_remove("-report.txt")
+
+humann.logs.df = humann.logs %>% 
+  map_dfr(.f = data.table::fread, .id = "Sample") %>% 
+  janitor::clean_names() %>% 
+  filter(!is.na(total_reads)) %>% 
+  rename(Sample = sample) %>% 
+  as_tibble()
+
+humann.report = humann.logs.df %>% 
+  na.omit() %>% 
+  janitor::clean_names() %>% 
+  rename(Sample = number_samples) %>% 
+  mutate(total_assigned = total_reads / (total_nucleotide_aligned + total_translated_aligned)) %>% 
+  mutate(nucleotide_percent = total_nucleotide_aligned / total_reads) %>% 
+  mutate(translated = total_translated_aligned / total_reads) %>% 
+  mutate(unassigned_percent =  1 - translated) %>% 
+  mutate(translated_percent = 1 - (unassigned_percent + nucleotide_percent))
+
+humann.report %>% 
+  rowwise() %>% 
+  mutate(sums = sum(nucleotide_percent, translated_percent)) %>% 
+  pull(sums) %>% sd()
+
+p1 = humann.report %>% 
+  gather(Metric, percent, -Sample) %>% 
+  filter(Metric %in% c("nucleotide_percent", "unassigned_percent", "translated_percent")) %>% 
+  mutate(Metric = fct_recode(Metric, Nucleotide = "nucleotide_percent", Translated = "translated_percent", `Unassigned reads` = "unassigned_percent")) %>% 
+  mutate(percent = as.numeric(percent)) %>% 
+  ggplot(aes(x = Sample, y = percent, fill = Metric)) +
+  geom_col() +
+  theme_classic() +
+  theme(axis.text.x = element_blank(), legend.position = "bottom") +
+  scale_fill_brewer(palette = "Paired") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1.05)) +
+  xlab("Sample") +
+  ylab("Percent of sequenced reads") 
+
+# Plot boxplot side-by-side
+p2 = humann.report %>% 
+  gather(Metric, percent, -Sample) %>% 
+  filter(Metric %in% c("nucleotide_percent", "unassigned_percent", "translated_percent")) %>% 
+  mutate(Metric = fct_recode(Metric, Nucleotide = "nucleotide_percent", Translated = "translated_percent", `Unassigned \n reads` = "unassigned_percent")) %>% 
+  mutate(percent = as.numeric(percent)) %>% 
+  ggplot(aes(x = Metric, y = percent, fill = Metric)) +
+  stat_boxplot(geom='errorbar', linetype=1, width=0.15) +
+  geom_boxplot(width = 0.5) +
+  guides(fill="none") +
+  theme_few() +
+  scale_fill_brewer(palette = "Paired") +
+  #jcolors::scale_fill_jcolors(palette = "default") +
+  scale_y_continuous(labels = scales::percent, limits = c(0,1.05)) +
+  xlab("") +
+  ylab("")
+
+# Plot together
+p = (p1 + p2) + plot_layout(widths = c(3, 1), guides = "collect") & theme(legend.position = 'bottom')
+p
+ggsave(filename = "output/figures/humann-summary.pdf", p, width = 11, height = 6)
+
+```
+
+
+# Harmonize data
+
+
+## Derosa
+```{r}
+# Derosa
+derosa.clinical = read_csv("../studies/derosa_nature_2022/derosa-metadata.csv") 
+
+derosa.metadata = read_csv("../studies/derosa_nature_2022/SraRunTable.csv") %>% 
+  left_join(derosa.clinical, by = c("Sample Name" = "SampleID")) %>% 
+  janitor::clean_names() %>% 
+  mutate(sample_id = run) %>% 
+  column_to_rownames("sample_id") %>% 
+  filter(best_response %in% c("CR", "PR", "PD", "SD")) %>% 
+  mutate(Response = if_else(best_response %in% c("CR", "PR"), "Responder", "Non-responder")) %>% 
+  mutate(Response = fct_relevel(Response, "Non-responder")) %>% 
+  mutate(atb = if_else(atb == "wnno", "no", atb)) %>% 
+  mutate(atb = if_else(atb == "wynes", "yes", atb)) %>% 
+  mutate(host_disease_status = "NSCLC") %>% 
+  mutate(Study = "Derosa") %>% 
+  rename(gender = sex,
+         Sample = run,
+         sampleId = sample_name) %>% 
+  mutate(gender = if_else(gender == "Femme", "female", "male")) %>% 
+  mutate(age_bin = cut(age, breaks = seq(10,100,5))) %>% 
+  mutate(age_bin = str_remove(age_bin, "\\(")) %>% 
+  mutate(age_bin = str_remove(age_bin, "\\]")) %>% 
+  mutate(age_bin = str_replace(age_bin, ",", "-")) %>% 
+  select(Sample, sampleId, Study, host_disease_status, Response, gender, age, age_bin, atb) %>% 
+  mutate(Response = as.character(Response)) %>% 
+  mutate(timepoint = "PreTreatment")
+
+# Make metaphlan4 object
+derosa.files = list.files("../studies/derosa_nature_2022/results/metaphlan/read_stats/", full.names = T)
+names(derosa.files) = list.files("../studies/derosa_nature_2022/results/metaphlan/read_stats/") %>% 
+  basename() %>% 
+  str_remove("-reads.txt")
+
+derosa.pseq = make_phyloseq4(table_fn = derosa.files, sampledata = derosa.metadata) 
+write_rds(derosa.pseq, "output/data/taxaprofiles/derosa-metaphlan.rda")
+
+# Import Metacyc abundances
+derosa.metacyc = import_metacyc("../studies/derosa_nature_2022/results/humann/pathway_abundance.txt", derosa.metadata, taxonomy = F)
+write_rds(derosa.metacyc, "output/data/metacyc/derosa-metacyc.rda")
+# Import eggNOG abundances
+derosa.eggnog = import_metacyc("../studies/derosa_nature_2022/results/humann/regroup/eggnog_families.txt", derosa.metadata, type = "kegg", taxonomy = )
+write_rds(derosa.eggnog, "output/data/regroup/derosa-eggnog.rda")
+
+# Import KEGG-compound abundances
+derosa.compound = import_metacyc("../studies/derosa_nature_2022/results/humann/regroup/kegg_compounds.txt", derosa.metadata)
+write_rds(derosa.compound, "output/data/regroup/derosa-compound.rda")
+
+```
+
+## Lee
+```{r}
+lee.metadata = read_csv("../studies/lee_nature_2022/SraRunTable.csv") %>% 
+  janitor::clean_names() %>% 
+  mutate(sample_id = run) %>% 
+  column_to_rownames("sample_id") %>% 
+  mutate(PFS12_response = if_else(pfs12 %in% c("yes", "no"), "Responder", "Non-responder")) %>% 
+  mutate(Response = if_else(orr %in% c("CR", "PR"), "Responder", "Non-responder")) %>% 
+  mutate(host_disease_status = "MELA") %>% 
+  mutate(Study = "Lee") %>% 
+  rename(gender = host_sex,
+         sampleId = sample_name_2,
+         age_bin = host_age_5yr_bin,
+         Sample = run) %>% 
+  mutate (age = str_sub(age_bin, 1, 2) %>% as.numeric()) %>% 
+  select(Sample, sampleId, Study, host_disease_status, Response, cohort, gender, age, age_bin) %>% 
+  mutate(Response = as.character(Response)) %>% 
+  mutate(timepoint = "PreTreatment")
+
+# Make metaphlan4 object
+lee.files = list.files("../studies/lee_nature_2022/results/metaphlan/read_stats/", full.names = T)
+names(lee.files) = list.files("../studies/lee_nature_2022/results/metaphlan/read_stats/") %>% 
+  basename() %>% 
+  str_remove("-reads.txt")
+lee.pseq = make_phyloseq4(table_fn = lee.files, sampledata = lee.metadata) 
+write_rds(lee.pseq, "output/data/taxaprofiles/lee-metaphlan.rda")
+
+# Import Metacyc abundances
+lee.metacyc = import_metacyc("../studies/lee_nature_2022/results/humann/pathway_abundance.txt", lee.metadata, taxonomy = F)
+write_rds(lee.metacyc, "output/data/metacyc/lee-metacyc.rda")
+
+# Import eggNOG abundances
+lee.eggnog = import_metacyc("../studies/lee_nature_2022/results/humann/regroup/eggnog_families.txt", lee.metadata, type = "kegg", taxonomy = F)
+write_rds(lee.eggnog, "output/data/regroup/lee-eggnog.rda")
+
+# Import KEGG-compound abundances
+lee.compound = import_metacyc("../studies/lee_nature_2022/results/humann/regroup/kegg_compounds.txt", lee.metadata)
+write_rds(lee.compound, "output/data/regroup/lee-compound.rda")
+```
+
+
+## Routy
+```{r}
+routy.metadata = read_csv("../studies/routy_science_2018/SraRunTable.csv") %>% 
+  janitor::clean_names() %>% 
+  mutate(sample_id = run) %>% 
+  mutate(Response = if_else(response %in% c("Progression", "Dead"), "Non-responder", "Responder")) %>% 
+  rename(atb = antibiotics) %>% 
+  column_to_rownames("sample_id") %>% 
+  mutate(Study = "Routy") %>% 
+  rename(Sample = run,
+         sampleId = sample_name_2,
+         gender = host_sex) %>% 
+  mutate(age_bin = cut(host_age, breaks = seq(10,100,5))) %>% 
+  mutate(age_bin = str_remove(age_bin, "\\(")) %>% 
+  mutate(age_bin = str_remove(age_bin, "\\]")) %>% 
+  mutate(age_bin = str_replace(age_bin, ",", "-")) %>% 
+  rename (age = host_age) %>% 
+  select(Sample, sampleId, Study, host_disease_status, Response, gender, age, age_bin, timepoint) %>% 
+  mutate(Response = as.character(Response)) %>% 
+  mutate(timepoint = if_else(timepoint == "T0", "PreTreatment", "PostTreatment"))
+
+# Make metaphlan4 object
+routy.files = list.files("../studies/routy_science_2018/results/metaphlan/read_stats/", full.names = T)
+names(routy.files) = list.files("../studies/routy_science_2018/results/metaphlan/read_stats/") %>% 
+  basename() %>% 
+  str_remove("-reads.txt")
+routy.pseq = make_phyloseq4(table_fn = routy.files, sampledata = routy.metadata) 
+write_rds(routy.pseq, "output/data/taxaprofiles/routy-metaphlan.rda")
+
+# Import Metacyc abundances
+routy.metacyc = import_metacyc("../studies/routy_science_2018/results/humann/pathway_abundance.txt", routy.metadata, taxonomy = F)
+write_rds(routy.metacyc, "output/data/metacyc/routy-metacyc.rda")
+
+# Import eggNOG abundances
+routy.eggnog = import_metacyc("../studies/routy_science_2018/results/humann/regroup/eggnog_families.txt", routy.metadata, type = "kegg", taxonomy = F)
+write_rds(routy.eggnog, "output/data/regroup/routy-eggnog.rda")
+
+# Import KEGG-compound abundances
+routy.compound = import_metacyc("../studies/routy_science_2018/results/humann/regroup/kegg_compounds.txt", routy.metadata)
+write_rds(routy.compound, "output/data/regroup/routy-compound.rda")
+```
+
+## Mcculloch
+```{r}
+mcculloch.clinical = read_csv("../studies/mcculloch_nature_2022/SraRunTable.csv") %>% 
+  janitor::clean_names() %>% 
+  mutate(sample_id = run) %>% 
+  column_to_rownames("sample_id") %>% 
+  mutate(Response = if_else(study_clin_response == "Responder", "Responder", "Non-responder")) %>% 
+  mutate(Response = fct_relevel(Response, "Non-responder")) %>% 
+  mutate(Study = "McCulloch") %>% 
+  mutate(host_disease_status = "MELA") %>% 
+  rename(Sample = run,
+         gender = sex,
+         sampleId = sample_name) %>% 
+  mutate(age_bin = cut(age, breaks = seq(10,100,5))) %>% 
+  mutate(age_bin = str_remove(age_bin, "\\(")) %>% 
+  mutate(age_bin = str_remove(age_bin, "\\]")) %>% 
+  mutate(age_bin = str_replace(age_bin, ",", "-")) %>% 
+  mutate(atb = if_else(abx_use == "Not_Used", "no", "yes")) %>% 
+  select(Sample, sampleId, Study, host_disease_status, timepoint, Response, gender, age, age_bin, atb, bmi) %>% 
+  mutate(Response = as.character(Response))
+
+# Make metaphlan4 object
+mcculloch.files = list.files("../studies/mcculloch_nature_2022/results/metaphlan/read_stats/", full.names = T)
+names(mcculloch.files) = list.files("../studies/mcculloch_nature_2022/results/metaphlan/read_stats/") %>% 
+  basename() %>% 
+  str_remove("-reads.txt")
+mcculloch.pseq = make_phyloseq4(table_fn = mcculloch.files, sampledata = mcculloch.clinical) 
+write_rds(mcculloch.pseq, "output/data/taxaprofiles/mcculloch-metaphlan.rda")
+
+# Import Metacyc abundances
+mcculloch.metacyc = import_metacyc("../studies/mcculloch_nature_2022/results/humann/pathway_abundance.txt", mcculloch.clinical, taxonomy = F)
+write_rds(mcculloch.metacyc, "output/data/metacyc/mcculloch-metacyc.rda")
+
+# Import eggNOG abundances
+mcculloch.eggnog = import_metacyc("../studies/mcculloch_nature_2022/results/humann/regroup/eggnog_families.txt", mcculloch.clinical, type = "kegg", taxonomy = F)
+write_rds(mcculloch.eggnog, "output/data/regroup/mcculloch-eggnog.rda")
+
+# Import KEGG-compound abundances
+mcculloch.compound = import_metacyc("../studies/mcculloch_nature_2022/results/humann/regroup/kegg_compounds.txt", mcculloch.clinical, type = "metacyc")
+write_rds(mcculloch.compound, "output/data/regroup/mcculloch-compound.rda")
+
+```
+
+## Spencer
+```{r}
+spencer.metadata = read_csv("../studies/spencer_science_2021/SraRunTable.csv") %>% 
+  janitor::clean_names() %>% 
+  mutate(sample_id = run) %>% 
+  column_to_rownames("sample_id")  %>% 
+  mutate(Response = if_else(response == 1, "Responder", "Non-responder")) %>% 
+  mutate(Response = fct_relevel(Response, "Non-responder")) %>% 
+  mutate(Study = "Spencer") %>% 
+  mutate(host_disease_status = "MELA") %>% 
+  mutate(sex = if_else(sex == "female", "female", "male")) %>% 
+  rename(Sample = run,
+         gender = sex,
+         sampleId = sample_name) %>% 
+  mutate(age = as.numeric(age)) %>% 
+  mutate(age_bin = cut(age, breaks = seq(10,100,5))) %>% 
+  mutate(age_bin = str_remove(age_bin, "\\(")) %>% 
+  mutate(age_bin = str_remove(age_bin, "\\]")) %>% 
+  mutate(age_bin = str_replace(age_bin, ",", "-")) %>% 
+  mutate(atb = if_else(antibiotics == 1, "yes", "no")) %>% 
+  mutate(atb = replace_na(atb, "no")) %>%
+  select(Sample, sampleId, Study, host_disease_status, Response, gender, age, age_bin, atb) %>% 
+  mutate(Response = as.character(Response)) %>% 
+  mutate(timepoint = "PreTreatment")
+
+# Make metaphlan4 object
+spencer.files = list.files("../studies/spencer_science_2021/results/metaphlan/read_stats/", full.names = T)
+names(spencer.files) = list.files("../studies/spencer_science_2021/results/metaphlan/read_stats/") %>% 
+  basename() %>% 
+  str_remove("-reads.txt")
+spencer.pseq = make_phyloseq4(table_fn = spencer.files, sampledata = spencer.metadata) 
+write_rds(spencer.pseq, "output/data/taxaprofiles/spencer-metaphlan.rda")
+
+# Import Metacyc abundances
+spencer.metacyc = import_metacyc("../studies/spencer_science_2021/results/humann/pathway_abundance.txt", spencer.metadata, taxonomy = F)
+write_rds(spencer.metacyc, "output/data/metacyc/spencer-metacyc.rda")
+
+# Import eggNOG abundances
+spencer.eggnog = import_metacyc("../studies/spencer_science_2021/results/humann/regroup/eggnog_families.txt", spencer.metadata, type = "kegg", taxonomy = F)
+write_rds(spencer.eggnog, "output/data/regroup/spencer-eggnog.rda")
+
+# Import KEGG-compound abundances
+spencer.compound = import_metacyc("../studies/spencer_science_2021/results/humann/regroup/kegg_compounds.txt", spencer.metadata)
+write_rds(spencer.compound, "output/data/regroup/spencer-compound.rda")
+
+```
+
+## Healthy
+```{r}
+healthy.files = list.files("../studies/healthy_500fg/results/metaphlan/read_stats", full.names = T)
+names(healthy.files) =  list.files("../studies/healthy_500fg/results/metaphlan/read_stats") %>% 
+  basename() %>% 
+  str_remove("-reads.txt")
+
+# Import metadata
+healthy.questions = read_csv("../studies/healthy_500fg/FG500_public_data_2022-11-18_13_12_11.csv") %>% 
+  janitor::clean_names() %>% 
+  rename(age = wat_is_uw_leeftijd_jaar,
+         host_subject_id = x500fg_identifier) %>% 
+  rename(sex = wat_is_uw_geslacht,
+         contraception = gebruikt_u_de_pil_als_anticonceptiemiddel,
+         smoking = bent_u_een_roker_of_een_roker_geweest)
+
+# Create metadata table
+healthy.metadata = read_csv("../studies/healthy_500fg/SraRunTable_n300.csv") %>% 
+  janitor::clean_names() %>% 
+  mutate(sample_id = run) %>% 
+  dplyr::left_join(healthy.questions) %>% 
+  mutate(Study = "Healthy",
+         Response = "Healthy",
+         timepoint = "Healthy") %>% 
+  column_to_rownames("sample_id")
+
+# Make phyloseq object
+healthy500fg.pseq = make_phyloseq4(table_fn = healthy.files, sampledata = healthy.metadata, tree = F) 
+# Save as object for downstream usage
+healthy500fg.pseq %>% 
+  write_rds("output/data/taxaprofiles/healthy500fg.pseq.rda")
+
+# Collapse to species level
+healthy500fg.pseq.sp = healthy500fg.pseq %>% 
+  aggregate_taxa("Species") %>% 
+  core(detection = 1/100, prevalence = 1/100, include.lowest = T) 
+
+# Import eggNOG abundances
+healthy.eggnog = import_metacyc("../studies/healthy_500fg/results/humann/eggnog_families.txt", healthy.metadata, type = "kegg", taxonomy = F)
+
+```
+
+## Merge data
+```{r}
+# Merge clinical data
+merged.clinical = bind_rows( derosa.metadata, lee.metadata, routy.metadata, mcculloch.clinical, spencer.metadata) %>% 
+  mutate(atb = replace_na(atb, "no/unknown")) %>% 
+  mutate(age_bin = replace_na(age_bin, "no/unknown")) %>%
+  mutate(timepoint = if_else(timepoint == "0", "PreTreatment", timepoint)) %>% 
+  mutate(timepoint = if_else(timepoint %in% c("31", "65", "7"), "PostTreatment", timepoint)) %>% 
+  write_tsv("output/data/merge/merged-clinicaldata.tsv")
+
+# Merge metaphlan tables
+int.species = merge_phyloseq(aggregate_taxa(lee.pseq, "Species"),
+                             aggregate_taxa(derosa.pseq, "Species"), 
+                             aggregate_taxa(routy.pseq, "Species"), 
+                             aggregate_taxa(mcculloch.pseq, "Species"), 
+                             aggregate_taxa(spencer.pseq, "Species"))
+write_rds(int.species, "output/data/merge/int.species.rda")
+
+# Merge metacyc tables
+int.metacyc = merge_phyloseq(lee.metacyc, derosa.metacyc, routy.metacyc, mcculloch.metacyc, spencer.metacyc)
+write_rds(int.metacyc, "output/data/merge/int.metacyc.rda")
+
+# Merge eggNOG tables
+int.eggnog = merge_phyloseq(lee.eggnog, derosa.eggnog, routy.eggnog, mcculloch.eggnog, spencer.eggnog) %>% 
+  subset_taxa(!grepl("\\|", Species))
+write_rds(int.eggnog, "output/data/merge/int.eggnog.rda")
+
+# Merge Compound tables
+int.compound = merge_phyloseq(derosa.compound, lee.compound, routy.compound, mcculloch.compound, spencer.compound)
+write_rds(int.compound, "output/data/merge/int.compound.rda")
+
+```
+
+```{r}
+#Load data
+#Read merged variables
+merged.clinical <- read_tsv("output/data/merge/merged-clinicaldata.tsv")
+int.species <- readRDS("output/data/merge/int.species.rda")
+int.metacyc <- readRDS("output/data/merge/int.metacyc.rda")
+int.eggnog <- readRDS("output/data/merge/int.eggnog.rda")
+int.compound <- readRDS("output/data/merge/int.compound.rda")
+```
+
+# Database overview
+
+Table S1
+```{r}
+# Overview of counts
+humann.logs = list.files("../studies/", pattern = "-report.txt", recursive = T, full.names = T)
+names(humann.logs) = list.files("../studies/", pattern = "-report.txt", recursive = T, full.names = F) %>% 
+  basename() %>% 
+  str_remove("-report.txt")
+
+humann.logs.df = humann.logs %>% 
+  map_dfr(.f = data.table::fread, .id = "Sample") %>% 
+  janitor::clean_names() %>% 
+  filter(!is.na(total_reads)) %>% 
+  rename(Sample = sample) %>% 
+  as_tibble()
+
+# Summary of studies
+# Count
+humann.logs.df.clinical = humann.logs.df %>% 
+  dplyr::left_join(merged.clinical) %>% 
+  janitor::clean_names() 
+
+library(gtsummary)
+clinical.char.plot = humann.logs.df.clinical |>
+  mutate(atb = replace_na(atb, "no/unknown")) %>% 
+  mutate(age_bin = replace_na(age_bin, "no/unknown"), 
+         atb = str_to_sentence(atb),
+         gender = str_to_sentence(gender)) %>%
+  rename(`Cancer type` = host_disease_status,
+         `Objective response` = response,
+         `Sex` = gender,
+         `Collection` = timepoint,
+         `Antibiotic use` = atb,
+         # `Age (5yr bin)` = age_bin,
+         `Age` = age,
+         `Species detected` = total_species) %>% 
+  select(study,  `Objective response`, `Cancer type`, `Antibiotic use`, Sex, `Age`, `Species detected`) %>% 
+  tbl_summary(by = study, missing = "no")
+
+clinical.char.plot
+
+gt::gtsave(as_gt(clinical.char.plot), #Save as html and print with chrome. 
+           path = "output/tables",
+           filename = "clinical_chart.html"
+           )
+
+clinical.char.plot %>% 
+  as_hux_xlsx("output/tables/clinical_chart.xlsx")
+
+write_rds(clinical.char.plot, file = "output/tables/clinical_chart.rds")
+write_csv(humann.logs.df.clinical, file = "output/tables/clinical_chart.csv")
+```
+
+
+Statistics samples used. 
+```{r}
+percent_response <- humann.logs.df.clinical %>%
+  filter (!is.na(study)) %>%
+  group_by(study, response) %>% 
+  summarise(number = n()) %>% 
+  ungroup() %>% 
+  group_by (study) %>% 
+  mutate (percent = number/sum (number)) %>% 
+  ungroup() %>% 
+  filter (response == "Responder") 
+
+mean_value <- mean(percent_response$percent)
+ci <- t.test(percent_response$percent)$conf.int
+
+cat("Mean:", mean_value, ", 95% CI:", ci, "\n")
+
+# Number of reads processed
+read_total = humann.logs.df.clinical %>% 
+  filter (!is.na(study)) %>% 
+  pull (total_reads) %>% 
+  sum() # 9.5e9
+cat("Reads processed:", read_total, "\n")
+
+# Average depth. 
+reads_mean = humann.logs.df.clinical %>% 
+  filter (!is.na(study)) %>% 
+  pull (total_reads) %>% 
+  mean() #12.5e6
+
+cat("Reads mean:", reads_mean, "\n")
+
+species_mean = humann.logs.df.clinical %>% 
+  filter (!is.na(study)) %>% 
+  pull (total_species) %>% 
+  mean() #585
+
+cat("Species mean:", species_mean, "\n")
+
+humann.logs.df.clinical %>% 
+  filter (!is.na(study)) %>% 
+  pull (total_species) %>% 
+  sd()
+```
+In total, we processed 9.5 billion metagenomic-derived reads at an average depth of 12.15 million reads per sample (Fig. S2A). [IM1] We detected on average 588 ± 158 species per sample (Fig. S2B).
+
+
+# Humann
+Figure 1A
+```{r}
+# Response rate
+study.response.plot = humann.logs.df.clinical %>% 
+  dplyr::count(study, response) %>% 
+  filter(response != "Donor") %>% 
+  ggplot(aes(x = reorder(study, -n), y = n, fill = response)) +
+  geom_col(color = "black") +
+  theme_classic() +
+  coord_flip() +
+  scale_fill_manual(values = c("Non-responder" = "darkred", "Responder" = "darkgreen")) +
+  theme(legend.position = c(0.75, 0.65),
+        legend.title = element_blank()) +
+  xlab("Studies") +
+  ylab("Number of samples")
+
+ggsave ("output/figures/icb_cohort_barplot.pdf", study.response.plot, height = 3, width = 5)
+```
+
+## Functional redundancy
+Figures 1B and 1C
+```{r}
+function.var = int.metacyc %>% 
+  microbiome::transform("compositional") %>% 
+  psmelt() %>% 
+  group_by(Species) %>% 
+  summarise(mean = mean(Abundance),
+            sd = sd(Abundance),
+            cv = sd/mean) %>% 
+  mutate(Type  = "Pathways (n=539)")
+  
+taxa.var = int.species %>% 
+  microbiome::transform("compositional") %>% 
+  psmelt() %>% 
+  group_by(Species) %>% 
+  summarise(mean = mean(Abundance),
+            sd = sd(Abundance),
+            cv = sd/mean) %>% 
+  mutate(Type = "Species (n=2551)")
+
+# Stats
+bind_rows(function.var, taxa.var) %>% 
+  rstatix::wilcox_test(cv ~ Type)
+
+bind_rows(function.var, taxa.var) %>% 
+  rstatix::cohens_d(cv ~ Type)
+
+# Plot distributions
+var.overview = bind_rows(function.var, taxa.var) %>% 
+  rename(`Data type` = Type) %>% 
+  ggplot(aes(x = cv, fill = `Data type`)) +
+  geom_density() +
+  theme_few() +
+  theme(legend.position = c(0.70, 0.80)) +
+  scale_fill_brewer(palette = "Paired") +
+  xlab("Coefficent of variation") +
+  ylab("Density")
+
+# Jaccard similarity
+jaccard.metacyc = int.metacyc %>% 
+  microbiome::transform("pa") %>%  # Convert to presence-absence
+  phyloseq::distance(method = "jaccard") %>% 
+  broom::tidy() %>% 
+  mutate(Type  = "Pathways (n=539)")
+
+jaccard.species = int.species %>% 
+  microbiome::transform("pa") %>%  # Convert to presence-absence
+  phyloseq::distance(method = "jaccard") %>% 
+  broom::tidy() %>% 
+  mutate(Type = "Species (n=2551)")
+
+jaccard.overview = bind_rows(jaccard.metacyc, jaccard.species) %>% 
+  rename(`Data type` = Type) %>% 
+  ggplot(aes(x = distance, fill = `Data type`)) +
+  geom_density() +
+  theme_few() +
+  theme(legend.position = c(0.70, 0.80)) +
+  scale_fill_brewer(palette = "Paired") +
+  xlab("Jaccard distance") +
+  ylab("Density")
+jaccard.overview
+
+p3 = ((var.overview + jaccard.overview)) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+p3 
+
+ggsave("output/figures/overview_densities_cv_jaccard.pdf", p3, height = 3, width = 6.5)
+
+```
+
+## Densities
+Plot with densities of species richness, seq depth, and pathway/ enzymes richness. 
+
+Figures S1C and S1D
+```{r}
+library (mia)
+tse.int.metacyc <- int.metacyc %>% 
+  convertFromPhyloseq() %>% 
+  addAlpha(
+    assay.type = "counts",
+    index = "observed_richness")
+
+num.pathways.plot <- tse.int.metacyc %>% 
+  colData() %>% 
+  as_tibble() %>% 
+  filter (observed_richness > 150) %>% 
+  ggplot(aes(x = observed_richness, fill = Study)) +
+  geom_density(alpha = 0.50) +
+  # geom_boxplot(alpha = 0.5) +
+  theme_few(base_size = 10) +
+  scale_fill_lancet() +
+  theme(legend.position = "none",
+        legend.title = element_blank()) +
+  xlab("Metacyc pathways") +
+  ylab("Density")
+
+tse.int.eggnog <- int.eggnog %>% 
+  convertFromPhyloseq() %>% 
+  addAlpha(
+    assay.type = "counts",
+    index = "observed_richness")
+
+num.eggnog.plot <- tse.int.eggnog %>% 
+  colData() %>% 
+  as_tibble() %>% 
+  filter (observed_richness > 4000) %>%
+  ggplot(aes(x = observed_richness, fill = Study)) +
+  geom_density(alpha = 0.50) +
+  # geom_boxplot(alpha = 0.5) +
+  theme_few(base_size = 10) +
+  scale_fill_lancet() +
+  theme(legend.position = "none",
+        legend.title = element_blank()) +
+  xlab("EggNOG orthologs") +
+  ylab("Density")
+
+
+num.reads.plot = humann.logs.df %>% 
+  dplyr::left_join(merged.clinical) %>% 
+  janitor::clean_names() %>% 
+  filter(!is.na(study)) %>% 
+  mutate(depth = (total_reads * 150) / 1000000000) %>% 
+  ggplot(aes(x = total_reads, fill = study)) +
+  geom_density(alpha = 0.50) +
+  theme_few(base_size = 10) +
+  scale_fill_lancet() +
+  theme(legend.position = c(0.75, 0.80),
+        legend.title = element_blank()) +
+  scale_x_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  xlab("Reads per sample") +
+  ylab("Density")
+num.reads.plot
+
+# Plot distribution of species
+num.sp.plot = humann.logs.df %>% 
+  dplyr::left_join(merged.clinical) %>% 
+  janitor::clean_names() %>% 
+  filter(!is.na(study)) %>% 
+  ggplot(aes(x = total_species, fill = study)) +
+  geom_density(alpha = 0.50) +
+  theme_few(base_size = 10) +
+  scale_fill_lancet() +
+  theme(legend.position = "none",
+        legend.title = element_blank()) +
+  xlab("Species") +
+  ylab("Density")
+num.sp.plot
+
+patch_density <- num.reads.plot +
+  num.sp.plot + 
+  num.pathways.plot +
+  num.eggnog.plot +
+  plot_layout(guides = "collect")
+
+patch_density
+
+ggsave ("output/figures/density_all.pdf", patch_density, width = 10, height = 4)
+```
+
+
+
+```{r}
+
+tse.int.metacyc <- int.metacyc %>% 
+  convertFromPhyloseq() %>% 
+  addAlpha(
+    assay.type = "counts",
+    index = "observed_richness")
+
+metacyc_richness <- tse.int.metacyc %>% 
+  colData() %>% 
+  as_tibble() %>% 
+  pull(observed_richness)
+mean (metacyc_richness)
+sd(metacyc_richness)
+
+eggnog_richness <- tse.int.eggnog %>% 
+  colData() %>% 
+  as_tibble() %>% 
+  pull(observed_richness)
+mean (eggnog_richness)
+sd(eggnog_richness)
+
+```
+
+### UpSet plot
+
+Figures 1D and 1F
+```{r}
+library(MicrobiotaProcess)
+library(UpSetR)
+
+# Generate UpSet data
+species.upset.data = get_upset(int.species, factorNames = "Study")
+species.upset = upset(species.upset.data,
+                      order.by = "freq",
+                      mb.ratio = c(0.7, 0.3),
+                      # number.angles = 90,
+                      set_size.numbers_size = 1.4,
+                      nintersects = 20,
+                      mainbar.y.label = "Species")
+
+pdf("output/figures/species-upset.pdf", width = 5, height = 3)
+species.upset
+dev.off()
+
+# Generate UpSet data
+func.upset.data = get_upset(int.metacyc, factorNames = "Study")
+func.upset = upset(func.upset.data,
+                   order.by = "freq",
+                   mb.ratio = c(0.7, 0.3),
+                   # number.angles = 90,
+                   set_size.numbers_size = 1.4,
+                   nintersects = 20,
+                   mainbar.y.label = "Pathways")
+
+pdf("output/figures/functional-upset.pdf", width = 6, height = 4)
+func.upset
+dev.off()
+
+pdf("output/figures/upset.pdf", width = 5, height = 3)
+func.upset
+species.upset
+dev.off()
+```
+
+## Batch correction
+
+### Species
+
+Figures S1G and S1H
+```{r}
+int.species.tse = mia::makeTreeSummarizedExperimentFromPhyloseq(int.species)
+
+# Other metrics like Aitchison to clr-transformed data
+int.species.tse <- transformAssay(int.species.tse,
+                                  method = "clr",
+                                  pseudocount = TRUE)
+
+int.species.tse <- transformAssay(int.species.tse,
+                                  method = "rclr")
+
+# Load package to plot reducedDim
+library(scater)
+
+# Batch correct
+int.species.comp = int.species %>% 
+  microbiome::transform("compositional") 
+
+library(MMUPHin)
+
+fit_adjust_batch <- adjust_batch(feature_abd = abundances(int.species.comp),
+                                 batch = "Study",
+                                 covariates = c("Response"),
+                                 data = meta(int.species.comp),
+                                 control = list(verbose = T,
+                                                diagnostic_plot = NULL)
+                                 )
+
+int.species.comp.adj = int.species.comp
+otu_table(int.species.comp.adj) = otu_table(fit_adjust_batch$feature_abd_adj, taxa_are_rows = T)
+
+int.species.comp.adj.tse = mia::makeTreeSummarizedExperimentFromPhyloseq(int.species.comp.adj)
+
+# Other metrics like Aitchison to clr-transformed data
+int.species.comp.adj.tse <- transformAssay(int.species.comp.adj.tse,
+                      method = "clr",
+                      pseudocount = TRUE)
+
+int.species.comp.adj.tse <- mia::runNMDS(int.species.comp.adj.tse,
+              FUN = vegan::vegdist,
+              method = "euclidean",
+              assay.type = "clr",
+              name = "NMDS_aitchison",
+              ntop = 2000)
+
+corrected.plot.study = scater::plotReducedDim(int.species.comp.adj.tse, "NMDS_aitchison",
+                                  colour_by = "Study",
+                                  point_alpha = 0.7) +
+  scale_fill_lancet() +
+  theme_classic() +
+  theme(text = element_text(size = 10.5)) +
+  xlab("NMDS 1") +
+  ylab("NMDS 2")
+corrected.plot.study
+
+corrected.plot.response = scater::plotReducedDim(int.species.comp.adj.tse, "NMDS_aitchison",
+                                  colour_by = "Response",
+                                  point_alpha = 0.7) +
+  scale_color_manual(values = c("Non-responder" = "darkred", "Responder" = "darkgreen")) +
+  theme_classic() +
+  theme(text = element_text(size = 10.5)) +
+  xlab("NMDS 1") +
+  ylab("NMDS 2") + 
+  labs (color = "Response")
+corrected.plot.response
+
+# Save both plots together
+p_species_corrected <- corrected.plot.study + corrected.plot.response + plot_layout(guides = "collect")
+ggsave("output/figures/microbeICB-nmds-species.pdf", p_species_corrected, width = 8.5, height = 4)
+
+# Remove legends
+corrected.plot.study <- corrected.plot.study + theme(legend.position = "none")
+corrected.plot.response <- corrected.plot.response + theme(legend.position = "none")
+
+```
+
+
+### Functional
+```{r}
+int.comp = int.eggnog %>% 
+  subset_samples(timepoint %in% c("PreTreatment")) %>% 
+  subset_samples(!(Sample %in% filter(lee.metadata, cohort != "PRIMM-NL")$Sample)) %>% 
+  microbiome::transform("compositional") 
+  
+meta(int.comp) %>% 
+  count(timepoint)
+
+library(MMUPHin)
+fit_adjust_batch <- adjust_batch(feature_abd = abundances(int.comp),
+                                 batch = "Study",
+                                 covariates = c("Response"),
+                                 data = meta(int.comp),
+                                 control = list(verbose = T,
+                                                zero_inflation = TRUE, 
+                                                diagnostic_plot = NULL))
+
+int.comp.adj = int.comp
+otu_table(int.comp.adj) = otu_table(fit_adjust_batch$feature_abd_adj, taxa_are_rows = T)
+int.comp.adj.tse = mia::makeTreeSummarizedExperimentFromPhyloseq(int.comp.adj)
+
+write_rds(int.comp.adj, "output/data/merge/int.eggnog.adj.rda")
+
+# Other metrics like Aitchison to clr-transformed data
+int.comp.adj.tse <- mia::transformAssay(int.comp.adj.tse, method = "relabundance")
+int.comp.adj.tse <- mia::transformAssay(int.comp.adj.tse, assay.type = "relabundance", method = "clr", pseudocount = TRUE)
+int.comp.adj.tse <- mia::transformAssay(int.comp.adj.tse, method = "rclr")
+
+int.comp.adj.tse <- mia::runNMDS(int.comp.adj.tse,
+              FUN = vegan::vegdist,
+              method = "euclidean",
+              assay.type = "clr",
+              scale = FALSE,
+              ntop = 2000,
+              name = "NMDS_aitchison")
+
+scater::plotReducedDim(int.comp.adj.tse, "NMDS_aitchison",
+                                  colour_by = "Response") +
+  theme_classic() +
+  geom_point(aes(color = colour_by), size = 3) +
+  scale_color_manual(values = c("Non-responder" = "darkred", "Responder" = "darkgreen")) +
+  theme(legend.position = "none", text = element_text(size = 10.5)) +
+  xlab("NMDS 1") +
+  ylab("NMDS 2") 
+
+scater::plotReducedDim(int.comp.adj.tse, "NMDS_aitchison",
+                                  colour_by = "Study") +
+  theme_classic() +
+  geom_point(aes(color = colour_by), size = 3) +
+  # scale_color_manual(values = c("Non-responder" = "darkred", "Responder" = "darkgreen")) +
+  theme(legend.position = "none", text = element_text(size = 10.5)) +
+  xlab("NMDS 1") +
+  ylab("NMDS 2") 
+```
+
+
+## Alpha diversity
+Figures 1F and 1G
+```{r}
+int.species.comp.adj.tse <- addAlpha(
+  int.species.comp.adj.tse,
+  assay.type = "counts",
+  index = c("shannon", "inverse_simpson", "camargo_evenness", "pielou_evenness")
+)
+colData(int.species.comp.adj.tse)$pielou <- colData(int.species.comp.adj.tse)$pielou_evenness
+
+merged.clinical <- merged.clinical %>% 
+  mutate (Study = Study %>% as.factor() %>% fct_relevel(
+    c ("McCulloch", "Lee", "Spencer", "Routy", "Derosa")
+  ))
+
+sp.evenness.plot = colData(int.species.comp.adj.tse) %>% 
+  as_tibble() %>% 
+  filter(Study != "Baruch") %>% 
+  filter(Response != "Post-treatment") %>%
+   mutate (Study = Study %>% as.factor() %>% fct_relevel(
+    c ("McCulloch", "Lee", "Spencer", "Routy", "Derosa")
+  )) %>% 
+  rename(response = Response) %>% 
+  mutate (response = ifelse (response == "Responder", "R", "NR")) %>% 
+  ggplot(aes(x = response, y = pielou, fill = response)) +
+  stat_boxplot(geom='errorbar', linetype=1, width=0.5) +  #whiskers
+  geom_boxplot() +
+  facet_grid(.~Study, scales = "free") +
+  theme_classic() +
+  scale_fill_manual(values = c("NR" = "darkred", "R" = "darkgreen")) +
+  xlab("") +
+  ylab("Species evenness") 
+
+sp.richness.plot = microbiome::richness(int.species) %>% 
+  rownames_to_column("Sample") %>% 
+  dplyr::left_join(merged.clinical) %>% 
+  janitor::clean_names() %>% 
+  filter(!is.na(study)) %>% 
+  filter(study != "Baruch") %>% 
+  filter(response != "Post-treatment") %>%
+  mutate (response = ifelse (response == "Responder", "R", "NR")) %>% 
+  ggplot(aes(x = response, y = observed, fill = response)) +
+  stat_boxplot(geom='errorbar', linetype=1, width=0.5) +  #whiskers
+  geom_boxplot() +
+  facet_grid(.~study, scales = "free") +
+  theme_classic() +
+  scale_fill_manual(values = c("NR" = "darkred", "R" = "darkgreen")) +
+  xlab("") +
+  ylab("Species richness") 
+ 
+sp.alpha = (sp.evenness.plot | sp.richness.plot) + plot_layout(guides = "collect")
+sp.alpha
+
+ggsave ("output/figures/evenness-richness.pdf", sp.alpha, height = 3.5, width = 9.5)
+
+```
+
+
+## Functional dysbiosis
+
+```{r}
+# Functional-level dysbiosis
+
+# Merge healthy.eggnog with batch-adjusted eggnog data. 
+pseq.merged = int.comp.adj %>% 
+  merge_phyloseq(healthy.eggnog, .) %>% 
+  subset_taxa(Species %in% intersect(taxa_names(healthy.eggnog), taxa_names(int.comp.adj))) %>% 
+  microbiome::transform("clr") 
+
+# Add column of metadata 
+sample_data(pseq.merged)$Type = meta(pseq.merged) %>% 
+  mutate(Type = if_else(timepoint == "Healthy", "500FG", "Cancer")) %>% 
+  pull(Type)
+
+# Compute dysbiosis
+dist.mat <- phyloseq::distance(pseq.merged, "euclidean")
+
+ref.samples <- pseq.merged %>% 
+  subset_samples(Type == "500FG") %>% 
+  sample_names()
+
+dysbiosis_2 <- dysbiosisR::euclideanDistCentroids(pseq.merged,
+                                                  dist_mat = dist.mat,
+                                                  use_squared = TRUE,
+                                                  group_col = "Type",
+                                                  control_label = "500FG",
+                                                  case_label = "Cancer") %>% 
+  filter(Type != "500FG") %>% 
+  mutate(dysbiosis = scale(CentroidDist_score)[,1]) %>% 
+  mutate(ResponseBool = if_else(Response == 'Responder', 1, 0))
+```
+
+
+Figure S2C
+```{r}
+# Association
+dys.fit = glm(ResponseBool ~ dysbiosis + atb + host_disease_status + age, data = dysbiosis_2, family = "binomial") 
+broom::tidy(dys.fit, exponentiate = T, conf.int = T)
+
+dysbiosis.response.boxplot <- dysbiosis_2 %>% 
+  ggplot (aes (y = dysbiosis, x = Response)) +
+  stat_boxplot(geom='errorbar', linetype=1, width=0.15) +
+  geom_boxplot(aes (fill = Response), show.legend = F) + 
+  scale_fill_manual(values = c("Non-responder" = "darkred", "Responder" = "darkgreen")) +
+  ggpubr::geom_bracket(label = "p=0.007", y.position = 2.45, xmin = 1, xmax = 2, label.size = 4) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs (y = "Functional dysbiosis", x = NULL) +
+  scale_x_discrete(labels=c('NR', 'R'))+
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none" 
+        ) +
+  guides(fill = guide_legend(title.position="top", title.hjust = 0.5))
+dysbiosis.response.boxplot
+ggsave ("output/figures/dysbiosis-allcohorts-response-boxplot.pdf", dysbiosis.response.boxplot, width = 3, height = 3.5)
+```
+
+
+Figure S2B
+```{r}
+# Distribution per study
+dysbiosis_boxplot <- dysbiosis_2 %>% 
+  dplyr::rename(`Cancer type` = host_disease_status) %>% 
+  # filter (Study != "Lee") %>%
+  ggplot(aes(y = dysbiosis, x = `Cancer type`, fill = `Cancer type`)) +
+  geom_quasirandom(size = 1) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_nejm() +
+  theme_bw(base_size = 14) +
+  stat_compare_means(vjust = -1) +
+  scale_y_continuous( expand = expansion(mult = c(0.05, 0.1))) +
+  labs(y = "Functional dysbiosis")
+dysbiosis_boxplot
+
+ggsave ("output/figures/icb_dysbiosis_tumor_class.pdf", dysbiosis_boxplot, height = 4.5, width = 7)
+
+```
+
+
+Statistics
+```{r}
+model = dysbiosis_2 %>% 
+  select (-age) %>% 
+  left_join(merged.clinical %>% select (Sample, age)) %>% 
+  glm(ResponseBool ~ dysbiosis + atb + host_disease_status + age, data = ., family = "binomial") 
+
+model %>% 
+  broom::tidy (exponentiate = T, conf.int = T)
+
+dys.fit = glm(ResponseBool ~ dysbiosis + atb + host_disease_status , data = dysbiosis_2, family = "binomial") 
+broom::tidy(dys.fit, exponentiate = T, conf.int = T)
+```
+
+
+Dimensionality reduction including the healthy cohort. 
+Figure S2A
+```{r }
+# Merge healthy.eggnog with batch-adjusted eggnog data. 
+pseq.merged.counts = int.comp.adj %>% 
+  merge_phyloseq(healthy.eggnog, .) %>% 
+  subset_taxa(Species %in% intersect(taxa_names(healthy.eggnog), taxa_names(int.comp.adj))) 
+
+# Add column of metadata 
+sample_data(pseq.merged.counts)$Type = meta(pseq.merged.counts) %>% 
+  mutate(Type = if_else(timepoint == "Healthy", "500FG", "Cancer")) %>% 
+  pull(Type)
+  
+int.eggnog.tse = mia::makeTreeSummarizedExperimentFromPhyloseq(pseq.merged.counts)
+
+# Other metrics like Aitchison to clr-transformed data
+int.eggnog.tse <- mia::transformAssay(int.eggnog.tse, method = "relabundance")
+int.eggnog.tse <- mia::transformAssay(int.eggnog.tse, assay.type = "counts", method = "clr", pseudocount = TRUE)
+int.eggnog.tse <- mia::transformAssay(int.eggnog.tse, method = "rclr")
+
+int.eggnog.tse <-runPCA(int.eggnog.tse,
+              assay.type = "clr",
+              scale = FALSE,
+              ntop = dim(int.eggnog.tse)[1],
+              name = "PCA_all")
+
+colData(int.eggnog.tse) = colData(int.eggnog.tse) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "rownames") %>% 
+  dplyr::left_join(select(dysbiosis_2, Sample, dysbiosis)) %>% 
+  column_to_rownames("rownames") %>% 
+  DataFrame()
+
+pca_all_scatter <- reducedDim(int.eggnog.tse, "PCA_all") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("SampleId") %>% 
+  left_join(colData(int.eggnog.tse) %>% as.data.frame() %>% rownames_to_column(var = "SampleId")) %>% 
+  mutate (dysbiosis = as.numeric (dysbiosis)) %>% 
+  ggplot (aes (PC1, PC2)) + 
+  geom_point (data = . %>% filter (Response == "Healthy"), 
+              color = "#F4A261", 
+              alpha = 0.6,
+              size = 3) +
+  annotate("text", x = 500, y = 325, label = "Healthy\nreference", color = "#F4A261", size = 4.5) +
+  geom_point (data = . %>% filter (Response != "Healthy"),
+              aes (color = dysbiosis), size = 3) +
+  theme_few() + 
+  labs (x = "PCA 1 (37%)",
+        y = "PCA 2 (3%)",
+        color = "Functional\ndysbiosis") +
+  scale_color_viridis_c()
+pca_all_scatter
+
+ggsave("output/figures/pca_dysbiosis.pdf", pca_all_scatter, width = 5.5, height = 4)
+
+```
+
+# Pathway differences
+
+### KEGG compound
+
+Figure 3A
+```{r}
+# list of HMBPP intermediate compounds 
+hmbpp.compounds = c("C11437", "C11434", "C11435", "C11436", "C11453", "C11811", "C00129", "C00235")
+hmbpp.kegg = c("K01662", "K00099", "K00991", "K00919", "K01770", "K12506", "K03526", "K03527", "K01823")
+
+compound.mmuphin = int.compound %>% 
+  subset_samples(timepoint %in% c("PreTreatment")) %>% 
+  subset_samples(!(Sample %in% filter(lee.metadata, cohort != "PRIMM-NL")$Sample)) %>% 
+  subset_taxa(Species != "UNGROUPED") %>% 
+  transform("compositional") %>% 
+  core(detection = 1/10000, prevalence = 25/100)
+  # core(detection = 0, prevalence = 25/100)
+
+fit_adjust_batch <- adjust_batch(feature_abd = abundances(compound.mmuphin),
+                                 batch = "Study",
+                                 covariates = c("Response"),
+                                 data = meta(compound.mmuphin),
+                                 control = list(verbose = T,
+                                                zero_inflation = T,
+                                                diagnostic_plot = NULL))
+compound.mmuphin.adj = compound.mmuphin
+otu_table(compound.mmuphin.adj) = otu_table(fit_adjust_batch$feature_abd_adj, taxa_are_rows = T)
+
+temp = meta(compound.mmuphin.adj) %>% 
+  select(Sample) %>% 
+  dplyr::left_join(merged.clinical) %>% 
+  mutate(samplee = Sample) %>% 
+  column_to_rownames("samplee")
+
+# Correction
+fit_lm_compound <- lm_meta(feature_abd = abundances(compound.mmuphin.adj),
+                       batch = "Study",
+                       exposure = "Response",
+                       covariates = c("age_bin", "host_disease_status", "atb"),
+                       control = list(normalization = "CLR", transform = "NONE"),
+                       data = temp %>% mutate (age_bin = as.factor(age_bin))) 
+
+# Universal enrichment analysis (Compound to pathway)
+library(KEGGREST)
+kegg.pathway.compound = keggLink("compound", "module")
+kegg.result <- data.frame(KEGG.ID = names(kegg.pathway.compound),
+                     Synonyms = unname(kegg.pathway.compound)) %>%
+  dplyr::mutate(KEGG.ID = stringr::str_replace(KEGG.ID, "md\\:", "")) %>% 
+  dplyr::mutate(Synonyms = stringr::str_replace(Synonyms, "cpd\\:", "")) 
+
+# Extract fits and convert
+fit_lm_compound.res = fit_lm_compound$meta_fits %>% 
+  filter(!is.na(coef)) %>% 
+  mutate(fdr = p.adjust(pval, "fdr")) %>% 
+  mutate(val = coef / stderr ) %>% 
+  #mutate(val = -log10(pval) * sign(coef) ) %>% 
+  filter(!is.infinite(val))
+
+# Make vector
+geneList = fit_lm_compound.res$val
+names(geneList) = fit_lm_compound.res$feature
+geneList = sort(geneList, decreasing = T)
+
+# Universal enrichment
+set.seed(4)
+y <- clusterProfiler::GSEA(geneList, TERM2GENE = kegg.result, minGSSize = 8, pvalueCutoff = 1, seed = F)
+
+compound.enrichment = y@result %>% 
+  left_join(module_names) %>% 
+  filter (qvalue <= 0.1) %>% 
+  mutate(direction = as.factor(if_else(NES > 0, "Responder", "Non-responder"))) %>% 
+  mutate(ID = paste0(short_name, " (", ID, ")")) %>% 
+  mutate(ID = str_wrap(ID, 100)) %>% 
+  mutate(qvalues.group = -log10(qvalue)) %>% 
+  ggplot(aes(x = reorder(ID, -NES), y = NES)) +
+  geom_col(width = 0.75, aes ( fill = direction), show.legend = F) +
+  theme_few() +
+  coord_flip() +
+  scale_fill_manual(values = c("Non-responder" = "darkred", "Responder" = "darkgreen")) +
+  # scale_fill_gsea() +
+  ylab("Enrichment score (NES)") +
+  xlab("KEGG Module")
+compound.enrichment
+
+ggsave("output/figures/ICB-KEGG-compounds.pdf",plot = compound.enrichment, width = 7, height = 4)
+```
+
+
+### Metacyc
+
+```{r }
+metacyc.mmuphin = int.metacyc %>% 
+  subset_samples(timepoint %in% c("PreTreatment")) %>% 
+  subset_samples(!(Sample %in% filter(lee.metadata, cohort != "PRIMM-NL")$Sample)) %>%
+  subset_taxa(Species != "UNGROUPED") %>% 
+  microbiome::transform("compositional") %>% 
+  core(detection = 1/1000, prevalence = 15/100)
+
+fit_adjust_batch <- adjust_batch(feature_abd = abundances(metacyc.mmuphin),
+                                 batch = "Study",
+                                 covariates = c("Response"),
+                                 data = meta(metacyc.mmuphin),
+                                 control = list(verbose = T,
+                                                zero_inflation = T, 
+                                                diagnostic_plot = NULL))
+metacyc.mmuphin.adj = metacyc.mmuphin
+otu_table(metacyc.mmuphin.adj) = otu_table(fit_adjust_batch$feature_abd_adj, taxa_are_rows = T)
+
+# Correction
+fit_lm_metacyc <- lm_meta(feature_abd = abundances(metacyc.mmuphin.adj),
+                       batch = "Study",
+                       exposure = "Response",
+                       covariates = c("age_bin", "host_disease_status", "atb"),
+                       control = list(normalization = "CLR",
+                                      transform = "NONE",
+                                      forest_plot = NULL),
+                       data = metacyc.mmuphin.adj %>% meta %>% mutate (age_bin = as.factor(age_bin))
+)
+
+# Extract fits and convert
+fit_lm_metacyc.res = fit_lm_metacyc$meta_fits %>% 
+  filter(!is.na(coef)) %>% 
+  mutate(fdr = p.adjust(pval, "fdr")) %>% 
+  mutate(val = coef / stderr ) %>% 
+  #mutate(val = -log10(pval) * sign(coef) ) %>% 
+  filter(!is.infinite(val))
+
+int.metacyc.basemean = metacyc.mmuphin.adj %>% 
+  transform_sample_counts(function(x) x * 1E6) %>% 
+  taxa_sums() %>% 
+  as.data.frame() %>% 
+  janitor::clean_names() %>% 
+  rename(baseMean = x) %>% 
+  rownames_to_column("feature")
+  
+temp = fit_lm_metacyc.res %>% 
+  left_join(int.metacyc.basemean) %>% 
+  mutate(Significance = if_else(pval < 0.05, "P<0.05", "P>0.05"))
+
+#Save table of results
+table_metacyc <- temp %>% 
+  arrange (pval) %>% 
+  rename (ID = feature) %>% 
+  left_join(., metacyc.names) %>% 
+  relocate(Name, .after = 1) %>% 
+  rename (metacyc_id = ID) %>% 
+  mutate (Increased_in = ifelse (coef > 0, "Responder", "Non-responder")) 
+
+table_metacyc %>%
+  write_csv("output/tables/metacyc_pathways_ICB_MMUPHin.csv")
+```
+
+
+Figure 3C
+```{r}
+mmuphin.metacyc.ma = temp %>% 
+  ggplot(aes(x = log10(baseMean), y = coef)) +
+  geom_point(aes(color = Significance)) +
+  ggrepel::geom_text_repel(aes(label = feature), data = filter(temp, feature %in% c("NONMEVIPP-PWY")), size = 3.5,
+                           nudge_x = -0.2,
+                           color = 'red',
+                           box.padding = 1,
+                           nudge_y = 0.0003,
+                           segment.curvature = -0.1,
+                           segment.ncp = 3,
+                           segment.angle = 40) +
+  ggrepel::geom_text_repel(aes(label = feature), data = filter(temp, feature %in% c( "PWY-5121")), size = 3.5,
+                           nudge_x = -0.15,
+                           box.padding = 1,
+                           nudge_y = 0.0003,
+                           segment.curvature = -0.1,
+                           segment.ncp = 3,
+                           segment.angle = 20) +
+  ggrepel::geom_text_repel(aes(label = feature), data = filter(temp, feature %in% c( "PWY-7560")), size = 3.5,
+                           nudge_x = +0.15,
+                           box.padding = 1,
+                           nudge_y = -0.0005,
+                           segment.curvature = 0.1,
+                           segment.ncp = 3,
+                           segment.angle = 20) +
+  geom_point(data = filter(temp, feature %in% c("NONMEVIPP-PWY", "PWY-5121", "PWY-7560")), color = "black", size = 3.5) +
+  geom_point(data = filter(temp, feature %in% c("NONMEVIPP-PWY", "PWY-7560", "PWY-5121")),
+             aes(color = Significance),
+             size = 2.5) +
+  theme_few() +
+  xlim(NA, 7) +
+  scale_color_manual(values = c("P>0.05" = "gray", "P<0.05" = "red")) +
+  theme(legend.position = c(0.20, 0.20), legend.title = element_blank()) +
+  xlab("Base mean (CPM [log10])") +
+  ylab("CLR difference")
+mmuphin.metacyc.ma
+
+ggsave("output/figures/ICB-ma-plot-hmbpp.pdf", mmuphin.metacyc.ma, width = 4, height = 4)
+```
+
+# HMBPP pathway per bacterial species. 
+
+## Species contributing to HMBPP pathway. 
+
+Figure S4A
+```{r}
+
+derosa.pathway.txa = data.table::fread("../studies/derosa_nature_2022/results/humann/pathway_abundance-cpm.txt") %>% 
+  rename(pathway = `# Pathway`) %>% 
+  filter(grepl("NONMEVIPP-PWY|PWY-7560|PWY-5121", pathway)) %>% 
+  pivot_longer(cols = -pathway) %>% 
+  group_by(pathway) %>% 
+  summarise(sum = sum(value)) %>% 
+  separate(pathway, into = c("pathway", "taxa"), sep = "\\|") %>% 
+  filter(!is.na(taxa)) %>% 
+  filter(taxa != "unclassified") 
+
+
+lee.pathway.txa = data.table::fread("../studies/lee_nature_2022/results/humann/pathway_abundance-cpm.txt") %>% 
+  rename(pathway = `# Pathway`) %>% 
+  filter(grepl("NONMEVIPP-PWY|PWY-7560|PWY-5121", pathway)) %>% 
+  pivot_longer(cols = -pathway) %>% 
+  group_by(pathway) %>% 
+  summarise(sum = sum(value)) %>% 
+  separate(pathway, into = c("pathway", "taxa"), sep = "\\|") %>% 
+  filter(!is.na(taxa)) %>% 
+  filter(taxa != "unclassified") 
+
+routy.pathway.txa = data.table::fread("../studies/routy_science_2018/results/humann/pathway_abundance-cpm.txt") %>% 
+  rename(pathway = `# Pathway`) %>% 
+  filter(grepl("NONMEVIPP-PWY|PWY-7560|PWY-5121", pathway)) %>% 
+  pivot_longer(cols = -pathway) %>% 
+  group_by(pathway) %>% 
+  summarise(sum = sum(value)) %>% 
+  separate(pathway, into = c("pathway", "taxa"), sep = "\\|") %>% 
+  filter(!is.na(taxa)) %>% 
+  filter(taxa != "unclassified") 
+
+mcculloch.pathway.txa = data.table::fread("../studies/mcculloch_nature_2022/results/humann/pathway_abundance-cpm.txt") %>% 
+  rename(pathway = `# Pathway`) %>% 
+  filter(grepl("NONMEVIPP-PWY|PWY-7560|PWY-5121", pathway)) %>% 
+  pivot_longer(cols = -pathway) %>% 
+  group_by(pathway) %>% 
+  summarise(sum = sum(value)) %>% 
+  separate(pathway, into = c("pathway", "taxa"), sep = "\\|") %>% 
+  filter(!is.na(taxa)) %>% 
+  filter(taxa != "unclassified") 
+
+spencer.pathway.txa = data.table::fread("../studies/spencer_science_2021/results/humann/pathway_abundance-cpm.txt") %>% 
+  rename(pathway = `# Pathway`) %>% 
+  filter(grepl("NONMEVIPP-PWY|PWY-7560|PWY-5121", pathway)) %>% 
+  pivot_longer(cols = -pathway) %>% 
+  group_by(pathway) %>% 
+  summarise(sum = sum(value)) %>% 
+  separate(pathway, into = c("pathway", "taxa"), sep = "\\|") %>% 
+  filter(!is.na(taxa)) %>% 
+  filter(taxa != "unclassified") 
+
+# Merge and plot
+merged.hmbpp.taxa = bind_rows(derosa.pathway.txa, lee.pathway.txa, routy.pathway.txa, mcculloch.pathway.txa, spencer.pathway.txa) %>% 
+  group_by(taxa) %>% 
+  summarise(abundance = sum(sum)) %>% 
+  mutate(rank = rank(abundance)) %>% 
+  mutate(group = if_else(taxa %in% c("g__Collinsella.s__Collinsella_aerofaciens", "g__Bacteroides.s__Bacteroides_caccae", "g__Blautia.s__Blautia_coccoides", "g__Escherichia.s__Escherichia_coli", "g__Eggerthella.s__Eggerthella_lenta"), "Tested", "nonTested")) %>% 
+  separate(taxa, into = c("Genus", "Species"), sep = "\\.")
+
+merged.hmbpp.taxa.plot = merged.hmbpp.taxa %>% 
+  ggplot(aes(x = reorder(Species, abundance), y = log10(abundance), color = group, label = Species)) +
+  geom_point() +
+  ggrepel::geom_text_repel(data = filter(merged.hmbpp.taxa, group == "Tested"), size = 3.5, box.padding = 1.5, max.overlaps = Inf) +
+  theme_few() +
+  theme(axis.text.x = element_blank(),
+        legend.position = "none") +
+  scale_color_manual(values = c("Tested" = "red", "Nontested" = "gray")) +
+  xlab("HMBPP producing Species (rank)") +
+  ylab("Counts per million (summed) [log10]")
+
+merged.hmbpp.taxa.plot
+
+```
+
+
+## Species with no genes mapping to HMBPP pathway
+Check for species in the resource that do not have any hits for genes involved in the pathway of HMBPP. 
+Figure S4B
+```{r}
+
+hmbpp.kegg = c("K01662", "K00099", "K00991", "K00919", "K01770", "K12506", "K03526", "K03527", "K01823")
+
+#Uniref90 sequences that have the KEGG annotations of the HMBPP pathway. 
+lines <- readLines("/home/m.p.martinez/common/humann/utility_mapping/map_ko_uniref90.txt.gz")
+data_list <- strsplit(lines, "\t")
+ko2uniref90_kegg <- tibble(
+  ID = sapply(data_list, `[[`, 1),
+  Elements = lapply(data_list, function(x) x[-1])  # Remove the first ID element
+) %>% 
+  filter (ID %in% hmbpp.kegg) %>% 
+  unnest(Elements) %>% 
+  dplyr::rename(Uniref90=Elements)
+
+#Load gene families of the HMPBPP pathway that map to known species per study. 
+hmbpp_genes_species.derosa <- data.table::fread("../studies/derosa_nature_2022/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+hmbpp_genes_species.lee <- data.table::fread("../studies/lee_nature_2022/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+hmbpp_genes_species.baruch <- data.table::fread("../studies/baruch_science_2021/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+hmbpp_genes_species.mcculloch <- data.table::fread("../studies/mcculloch_nature_2022/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+hmbpp_genes_species.spencer <- data.table::fread("../studies/spencer_science_2021/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+hmbpp_genes_species.routy <- data.table::fread("../studies/routy_science_2018/results/humann/gene_families.txt") %>% 
+  select (`# Gene Family`) %>% 
+  rename (gene_family = `# Gene Family`) %>% 
+  filter (str_detect(gene_family, "\\|")) %>% 
+  separate_wider_delim(gene_family, "|", names = c("Uniref90", "taxa")) %>% 
+  filter (taxa != "unclassified") %>% 
+  separate_wider_delim(taxa, ".", names = c("Genus", "Species"), cols_remove = FALSE) %>% 
+  mutate (Genus = str_remove(Genus, "g__"), 
+          Species = str_remove(Species, "s__")) %>% 
+  inner_join(ko2uniref90_kegg) 
+gc()
+
+#Join all studies
+merged.hmbpp.KO.taxa = bind_rows(hmbpp_genes_species.baruch, hmbpp_genes_species.derosa, hmbpp_genes_species.lee, hmbpp_genes_species.mcculloch, hmbpp_genes_species.routy, hmbpp_genes_species.spencer) %>% 
+  distinct (ID, Genus, Species, taxa)
+
+int.species = read_rds("output/data/merge/int.species.rda")
+
+hmbpp.neg.species.abundace <- int.species %>% 
+  transform_sample_counts(function(x) { (x/sum(x)) * 1000}) %>% 
+  otu_table()  %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "Species") %>% 
+  pivot_longer(cols = -Species) %>% 
+  group_by(Species) %>% 
+  summarise(abundance = sum(value)) %>% 
+  filter (!Species %in% merged.hmbpp.KO.taxa$Species) 
+
+#Plot of the distribution of bacteria species negative for HMBPP pathway with respect to negative control used. 
+non.hmbpp.taxa.plot  <- hmbpp.neg.species.abundace %>% 
+  ggplot(aes(x = reorder(Species, abundance), y = log10(abundance), label = Species)) +
+  geom_point() +
+  geom_point(data = . %>% filter(Species == "Lactiplantibacillus_plantarum"), color = "red") +
+  ggrepel::geom_label_repel(data = . %>% filter(Species == "Lactiplantibacillus_plantarum"), size = 4.5, box.padding = 1.5, max.overlaps = Inf) +
+  theme_few(base_size = 14) +
+  theme(axis.text.x = element_blank(),
+        legend.position = "none") +
+  xlab("Non HMBPP producing Species (rank)") +
+  ylab("Counts per million (summed) [log10]") +
+  labs (subtitle = "Species with no reads mapping to MEP pathway enzymes")
+
+non.hmbpp.taxa.plot
+ggsave ("output/figures/non_hmbpp_producers.pdf", plot = non.hmbpp.taxa.plot,  width = 5, height = 5)
+
+```
+
