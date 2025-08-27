@@ -17,9 +17,6 @@ The analyses performed include:
 This analysis makes use of a Google Cloud (GCP) based Nextflow pipeline to process whole metagenome sequences with the Biobakery tools Humann and Metaphlan.
 The pipeline can be found at: https://github.com/miparrama/biobakery-nf
 
-## Data
-Compositions of the data can be found:
-
 ## Contributors
 
 - [Miguel Parra-Martinez](https://github.com/miparrama) - [@miparrama](https://github.com/miparrama)
