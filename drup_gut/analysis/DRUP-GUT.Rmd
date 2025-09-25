@@ -19,9 +19,12 @@ metacyc.names = data.table::fread("../../resources/map_metacyc-pwy_name.txt.gz",
 
 # Import tumor features
 ```{r}
-# # Import all MSI-samples (n=107)
-complete.msicohort = read_csv("/DATA/share/Voesties/data/resources/msi_cohort/biomarkers/data/dMMR-MSIH-ICB-all.csv") %>%
-  filter(msStatus == "MSI")
+# # Import all MSI-samples (n=103)
+complete.msicohort = read_csv("resources/dMMR-MSIH-ICB-all.csv") %>%
+  filter(msStatus == "MSI") # Confirmed to be MSI by WGS. 
+
+immune_signatures = read_csv("resources/immune-signatures-cpm.csv") %>% 
+  rename(sampleId = sample_id)
 ```
 
 
@@ -50,7 +53,6 @@ p1 = humann.report %>%
   geom_col() +
   theme_classic2() +
   theme(axis.text.x = element_blank(), legend.position = "bottom") +
-  # jcolors::scale_fill_jcolors(palette = "default") +
   scale_fill_brewer(palette = "Paired") +
   scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
   xlab("Sample") +
@@ -68,7 +70,6 @@ p2 = humann.report %>%
   guides(fill="none") +
   theme_few() +
   scale_fill_brewer(palette = "Paired") +
-  #jcolors::scale_fill_jcolors(palette = "default") +
   scale_y_continuous(labels = scales::percent, limits = c(0,1.05)) +
   xlab("") +
   ylab("")
@@ -97,16 +98,8 @@ names(metaphlan.files) =  list.files("../workflows/biobakery/results/metaphlan/r
 # Remove negative control
 metaphlan.files = metaphlan.files[names(metaphlan.files) != "NA"]
 
-# Statistics of the cohort
-clinical.data = readxl::read_excel("/DATA/share/Voesties/data/resources/msi_cohort/data/Nivolumab1st2ndand3trdstage_forTomandJoris.xlsx") %>%
-  dplyr::select(subjectkey, birth.year ) %>%
-  mutate(subjectkey = str_remove_all(subjectkey, "-")) %>%
-  mutate(age = 2020 - birth.year) %>%
-  rename(patientId = subjectkey) %>%
-  dplyr::select(patientId, age)
-
 # Create metadata table
-drup.metadata = read_csv("../preprocessing/drup-gut-metadata.csv") %>%
+drup.metadata = read_csv("resources/drup-gut-metadata.csv") %>%
   filter(Sample %in% names(metaphlan.files)) %>%
   add_count(patientId, name = "num_samples") %>%
   mutate(lineage = if_else(tumor_type %in% c("Endometrial cancer", "CRC", "Stomach cancer", "Small intestine cancer"), "lineage", "nonlineage")) %>%
@@ -115,7 +108,7 @@ drup.metadata = read_csv("../preprocessing/drup-gut-metadata.csv") %>%
   mutate(time = if_else(timepoint == "T1", 0, if_else(timepoint == "T3", 2, 1))) %>%
   mutate(ATB_use = if_else(ATB_use == "Unknown", "No", ATB_use)) %>%
   mutate(PPI_use = if_else(ATB_use == "Unknown", "No", PPI_use))  %>%
-  left_join(clinical.data) %>%
+  mutate(age = 2020 - birth.year) %>%
   mutate(sample_id = Sample) %>%
   column_to_rownames("sample_id") %>%
   mutate(Response = fct_relevel(Response, "Non-responder")) %>%
@@ -126,7 +119,8 @@ drup.metadata = read_csv("../preprocessing/drup-gut-metadata.csv") %>%
 
 # Make phyloseq objects
 pseq.reads = make_phyloseq4(table_fn = metaphlan.files,
-                            sampledata = drup.metadata) %>%
+                            sampledata = drup.metadata,
+                            tree = T) %>%
   subset_samples(Response != "MISSING") %>%
   subset_samples(Response != "FOLLOWS") %>%
   subset_samples(Response != "NE") %>%
@@ -141,6 +135,7 @@ saveRDS(pseq.reads, 'output/data/pseq.reads.rda')
 pseq.species = pseq.reads %>%
   aggregate_taxa("Species") %>%
   core(detection = 1/100, prevalence = 5/100, include.lowest = T)
+
 saveRDS(pseq.species, 'output/data/pseq.species.rda')
 ```
 
@@ -239,7 +234,6 @@ drup.dysbiosis %>%
   left_join(select(meta(drup.eggnog), patientId, tumor_groups, timepoint, ATB_use, PPI_use, Response, age) %>%
               filter(timepoint == "T1")) %>%
   mutate(response = if_else(Response == "Responder", 1, 0)) %>% 
-  # glm(response ~ diff + tumor_groups + ATB_use, data = ., family="binomial") %>% 
   lm(diff ~ Response + tumor_groups + ATB_use , data = .) %>%
   tidy()
 
@@ -286,8 +280,6 @@ drup.delta = drup.dysbiosis %>%
   stat_boxplot(geom='errorbar', linetype=1, width=0.15) +
   geom_boxplot(aes (fill = Response)) +
   theme_classic(base_size = 10.5) +
-  # ggpubr::rotate_x_text(90) +
-  # ggpubr::stat_compare_means(comparisons = list(c("Non-responder", "Responder"))) +
   ggpubr::geom_bracket(label = "p=0.016", y.position = 2.65, xmin = 1, xmax = 2, label.size = 4) +
   scale_x_discrete(labels=c('NR', 'R')) +
   guides(fill = F) +

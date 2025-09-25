@@ -6,7 +6,7 @@ library(remotes)
 library(DivNet)
 library(RColorBrewer)
 library(lubridate)
-# library(ANCOMBC) #not
+
 library(ggthemes)
 library(viridis)
 library(scater)
@@ -15,9 +15,7 @@ library(mia)
 library(miaViz)
 library(tidyHeatmap)
 library(ggsci)
-# library(omixerRpm) #Not
-#library(MMUPHin)
-#library(curatedMetagenomicData)
+
 library (broom)
 library(ggbeeswarm)
 library(ggpubr)
@@ -33,22 +31,9 @@ library (janitor)
 library(microbiome)
 library(tidyverse)
 
-# Full mp3 tree
-mp4.tree  = read_tree("resources/mpa_vJan21_CHOCOPhlAnSGB_202103.nwk")
-mp4.tree$tip.label = mp4.tree$tip.label %>% 
-  as_tibble() %>% 
-  separate(value, into = c("NCBI", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), sep = "\\|") %>% 
-  mutate(Kingdom = str_remove(Kingdom, "k__"),
-         Phylum = str_remove(Phylum, "p__"),
-         Class = str_remove(Class, "c__"),
-         Order = str_remove(Order, "o__"),
-         Family = str_remove(Family, "f__"),
-         Genus = str_remove(Genus, "g__"), 
-         Species = str_remove(Species, "s__")) %>% 
-  pull(Species)
 
 # Import metacyc Names
-metacyc.names = vroom::vroom("resources/map_metacyc-pwy_name.txt.gz", col_names = c("ID", "Name"))
+metacyc.names = vroom::vroom("../../resources/map_metacyc-pwy_name.txt.gz", col_names = c("ID", "Name"))
 
 # Make phyloseq object from metaphlan output
 make_phyloseq = function(table_fn, sampledata) {
@@ -111,7 +96,7 @@ make_phyloseq = function(table_fn, sampledata) {
   
 }
 
-make_phyloseq4 = function(table_fn, sampledata, tree = T, relab = F) {
+make_phyloseq4 = function(table_fn, sampledata, tree = F, relab = F) {
   
   # Import metaphlan results (rel w readstats)
   if(relab){
@@ -189,7 +174,7 @@ make_phyloseq4 = function(table_fn, sampledata, tree = T, relab = F) {
   
   # Get phylogenetic tree
   if(tree){
-    mpa_tree = ape::read.tree("resources/mpa_vJan21_CHOCOPhlAnSGB_202103.nwk")
+    mpa_tree = ape::read.tree("http://cmprod1.cibio.unitn.it/biobakery4/metaphlan_databases/mpa_vOct22_CHOCOPhlAnSGB_202212.nwk")
     mpa_tree$tip.label = paste0("SGB", mpa_tree$tip.label)
     pseq.tree = merge_phyloseq(pseq.stats, mpa_tree)
     return(pseq.tree)
@@ -1077,134 +1062,6 @@ filter_variance = function(pseq.in, var = 0.20) {
 
 }
 
-
-make_metacyc_boxplot = function(pseq, pathway = "PWY-7560"){
-  
-  model.data = metacyc.pseq %>% 
-    subset_samples(timepoint != "T3") %>%
-    transform_sample_counts(function(x) x + 0.5) %>% 
-    transform(transform = "clr") %>% 
-    psmelt() %>% 
-    filter(OTU == as.character(pathway)) %>% 
-    mutate(zscore = scale(Abundance)[,1])
-  
-  fit = lmerTest::lmer(zscore ~ Response*timepoint + tumor_groups + PPI_use + ATB_use + (1|patientId), data = model.data) 
-  
-  fit %>% 
-    broom::tidy() %>% 
-    print()
-
-  sjPlot::plot_model(fit, type = "int")$data %>% 
-    as.data.frame() 
-    
-  
-}
-
-
-simulate_attacks = function(pseq, attack_type = "between", measure = "pearson", zeroMethod = "pseudo", normMethod = "clr") {
-  
-  # Create un-perturbed network
-  unpertub.net = netConstruct(data = pseq, 
-                              measurePar = list(nlambda=10, lambda.min.ratio=0.1, pulsar.params=list(rep.num=10)),
-                              normMethod = normMethod,
-                              zeroMethod = zeroMethod,
-                              measure = measure,
-                              cores = 16,
-                              sparsMethod = "threshold", 
-                              thresh = 0.30,
-                              seed = 42)
-  
-  unpertub.analyze.out <- netAnalyze(unpertub.net, gcmHeat = F)
-  n_lcc_nodes = unpertub.analyze.out$compSize1[1]
-  
-  largest.taxa = unpertub.analyze.out$centralities[c(1,3,5,7)] %>% 
-    as.data.frame() %>% 
-    rownames_to_column("Sample") %>% 
-    pivot_longer(cols = -Sample) %>% 
-    mutate(name = str_remove(name, "1")) 
-  
-  # Compute % to remove
-  percent_ranks = round(seq(0, 0.90, 0.10) * n_lcc_nodes)
-
-  # Iterate over ranks
-  percent_ranks %>% 
-    map_df(.f = function(x){
-      
-      message(paste0("Working on: ", x))
-    
-      # Remove taxa
-      if(x > 0){
-        if(attack_type == "random") {
-          to_remove = largest.taxa %>% 
-            sample_n(size = x) %>% 
-            pull(Sample)
-        } else {
-          to_remove = largest.taxa %>% 
-            filter(name == attack_type) %>% 
-            slice_max(order_by = value, n = x, with_ties = F) %>% 
-            pull(Sample)
-        }
-        oldMA <- as(tax_table(pseq), "matrix")
-        oldDF <- data.frame(oldMA)
-        newDF <- subset(oldDF, !(Species %in% to_remove))
-        newMA <- as(newDF, "matrix")
-        tax_table(pseq) <- tax_table(newMA)
-      }
-      
-      net.out = netConstruct(data = pseq, 
-                   measurePar = list(nlambda=10, lambda.min.ratio=0.1, pulsar.params=list(rep.num=10)),
-                   normMethod = normMethod,
-                   zeroMethod = zeroMethod,
-                   measure = measure,
-                   sparsMethod = "threshold", 
-                   thresh = 0.30,
-                   cores = 16,
-                   seed = 42)
-
-      
-      analyze.out <- netAnalyze(net.out, gcmHeat = F)
-      
-      data.frame(num_removed = x,
-                 percent_removed = x / n_lcc_nodes,
-                 n_lcc_nodes = n_lcc_nodes,
-                 attack_type = attack_type,
-                 lccSize = analyze.out$globalPropsLCC$lccSize1,
-                 lccSizeRel = analyze.out$globalPropsLCC$lccSizeRel1,
-                 avDiss = analyze.out$globalPropsLCC$avDiss1,
-                 avPath = analyze.out$globalPropsLCC$avPath1,
-                 clustCoef = analyze.out$globalPropsLCC$clustCoef1,
-                 modularity = analyze.out$globalPropsLCC$modularity1,
-                 vertConnect = analyze.out$globalPropsLCC$vertConnect1,
-                 edgeConnect = analyze.out$globalPropsLCC$edgeConnect1,
-                 natConnect = analyze.out$globalPropsLCC$natConnect1,
-                 pep = analyze.out$globalPropsLCC$pep1,
-                 percent = (analyze.out$globalPropsLCC$lccSize1 / n_lcc_nodes))
-    })
-  
-}
-
-get_residuals = function(input.table, formula = c("primaryTumorLocation", "biopsySite")) {
-  input.table.long = input.table %>% 
-    pivot_longer(cols = -Sample, names_to = "signatures", values_to = "y") %>% 
-    inner_join(meta(pseq.reads)) %>% 
-    as_tibble() 
-  
-  unique(input.table.long$signatures) %>% 
-    map_dfr(.f = function(x) {
-      input.table.long %>% 
-        filter(signatures == x) %>% 
-        tibble::column_to_rownames("Sample") %>% 
-        glm(as.formula(paste("y", paste(formula, collapse=" + "), sep=" ~ ")), data = ., family = "gaussian") %>% 
-        broom::augment() %>% 
-        rename(Sample = `.rownames`,
-               residual = `.resid`) %>% 
-        mutate(diff = residual - mean(residual)) %>% 
-        select(Sample, diff) %>% 
-        mutate(signatures = x)
-    }) %>% 
-    pivot_wider(id_cols = Sample, names_from = signatures, values_from = diff) %>% 
-    as.data.frame() 
-}
 
 get_residuals2 = function(input.table, formula = c("primaryTumorLocation", "biopsySite")) {
   input.table.long = input.table %>% 

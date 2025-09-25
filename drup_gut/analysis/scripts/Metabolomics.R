@@ -6,19 +6,17 @@ library (janitor)
 
 # Setup -------------------------------------------------------------------
 
-tse.metabo.fil <- read_rds ("~/projects/gut-microbiome/gut-metabolomics/output/data/metabolomics/metabolomics.se.fil.rds")
-tse.metabo <- read_rds ("~/projects/gut-microbiome/gut-metabolomics/output/data/metabolomics/metabolomics.se.rds")
+tse.metabo.fil <- read_rds ("resources/metabolomics.se.fil.rds")
 
 drup.functional.dysbiosis <- read_csv ("output/data/drup-functional-dysbiosis.csv")
 
 # Filter data
-colData(tse.metabo) <- tse.metabo %>% 
+colData(tse.metabo.fil) <- tse.metabo.fil %>% 
   coltibble() %>% 
   mutate (dysbiosis_level = ifelse (dysbiosis > 0, "High", "Low")) %>% 
   DataFrame()
 
-tse.metabo.dysbiosis <- tse.metabo[,colData(tse.metabo)$dysbiosis_level %in% c("High", "Low")]
-tse.metabo.dysbiosis <- tse.metabo.dysbiosis [, colData(tse.metabo.dysbiosis)$Sample %in% colData(tse.metabo.fil)$Sample]
+tse.metabo.dysbiosis <- tse.metabo.fil[,colData(tse.metabo.fil)$dysbiosis_level %in% c("High", "Low")]
 
 rowData(tse.metabo.dysbiosis)$prevalence <- rowMeans(assay(tse.metabo.dysbiosis) > rowData(tse.metabo.dysbiosis)$lod)
 
@@ -90,5 +88,19 @@ dysbiosis_continious_pca
 
 # Save plot: 
 ggsave ("output/figures/metabolomics_dysbiosis_pca.pdf",dysbiosis_continious_pca, height = 6, width = 7 )
+
+
+# Permanova ----------------------------------------------------------------
+
+library (vegan)
+
+otu_table <- assays(tse.metabo.dysbiosis)$log10  
+otu_table <- t(otu_table) 
+
+dist_matrix <- vegdist(otu_table, method = "euclidean")
+
+set.seed(5)
+adonis_result <- adonis2(dist_matrix ~ dysbiosis + ATB_use + tumor_class + Response, data = coltibble(tse.metabo.dysbiosis), permutations = 1000)
+adonis_result
 
 
